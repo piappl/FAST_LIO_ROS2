@@ -1,3 +1,4 @@
+// clang-format off
 #ifndef COMMON_LIB_H
 #define COMMON_LIB_H
 
@@ -15,7 +16,7 @@ using namespace Eigen;
 #define USE_IKFOM
 
 #define PI_M (3.14159265358)
-#define G_m_s2 (9.81)         // Gravaty const in GuangDong/China
+#define G_m_s2 (1.0)          // Our IMU have valid ROS2 unit
 #define DIM_STATE (18)        // Dimension of states (Let Dim(SO(3)) = 3)
 #define DIM_PROC_N (12)       // Dimension of process noise (Let Dim(SO(3)) = 3)
 #define CUBE_LEN  (6.0)
@@ -202,7 +203,7 @@ bool esti_normvector(Matrix<T, 3, 1> &normvec, const PointVector &point, const T
         A(j,2) = point[j].z;
     }
     normvec = A.colPivHouseholderQr().solve(b);
-    
+
     for (int j = 0; j < point_num; j++)
     {
         if (fabs(normvec(0) * point[j].x + normvec(1) * point[j].y + normvec(2) * point[j].z + 1.0f) > threshold)
