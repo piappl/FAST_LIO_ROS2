@@ -98,6 +98,7 @@ int    iterCount = 0, feats_down_size = 0, NUM_MAX_ITERATIONS = 0, laserCloudVal
 bool   point_selected_surf[100000] = {0};
 bool   lidar_pushed, flg_first_scan = true, flg_exit = false, flg_EKF_inited;
 bool   scan_pub_en = false, dense_pub_en = false, scan_body_pub_en = false;
+bool   broadcast_tf = true;
 bool    is_first_lidar = true;
 
 vector<vector<int>>  pointSearchInd_surf;
@@ -655,7 +656,10 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
     trans.transform.rotation.x = odomAftMapped.pose.pose.orientation.x;
     trans.transform.rotation.y = odomAftMapped.pose.pose.orientation.y;
     trans.transform.rotation.z = odomAftMapped.pose.pose.orientation.z;
-    // tf_br->sendTransform(trans);
+    if (broadcast_tf)
+    {
+        tf_br->sendTransform(trans);
+    }
 }
 
 void publish_path(rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath)
@@ -804,6 +808,7 @@ public:
         this->declare_parameter<bool>("publish.scan_publish_en", true);
         this->declare_parameter<bool>("publish.dense_publish_en", true);
         this->declare_parameter<bool>("publish.scan_bodyframe_pub_en", true);
+        this->declare_parameter<bool>("publish.broadcast_tf", true);
         this->declare_parameter<int>("max_iteration", 4);
         this->declare_parameter<string>("map_file_path", "");
         this->declare_parameter<string>("common.lid_topic", "/livox/lidar");
@@ -842,6 +847,7 @@ public:
         this->get_parameter_or<bool>("publish.scan_publish_en", scan_pub_en, true);
         this->get_parameter_or<bool>("publish.dense_publish_en", dense_pub_en, true);
         this->get_parameter_or<bool>("publish.scan_bodyframe_pub_en", scan_body_pub_en, true);
+        this->get_parameter_or<bool>("publish.broadcast_tf", broadcast_tf, true);
         this->get_parameter_or<int>("max_iteration", NUM_MAX_ITERATIONS, 4);
         this->get_parameter_or<string>("map_file_path", map_file_path, "");
         this->get_parameter_or<string>("common.lid_topic", lid_topic, "/livox/lidar");
