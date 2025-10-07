@@ -121,6 +121,7 @@ typedef struct {
   float reflectivity; /**< Reflectivity   */
   uint8_t tag;        /**< Livox point tag   */
   uint8_t line;       /**< Laser line id     */
+  double timestamp;      /**< Point registration time ns */
 } LivoxPointXyzrtl;
 
 typedef struct {
@@ -130,6 +131,7 @@ typedef struct {
   float intensity;    /**< Intensity   */
   uint8_t tag;        /**< Livox point tag   */
   uint8_t line;       /**< Laser line id     */
+  double timestamp;      /**< Point registration time ns */
 } LivoxPointXyzitl;
 }
 POINT_CLOUD_REGISTER_POINT_STRUCT(livox_ros::LivoxPointXyzrtl,
@@ -139,6 +141,7 @@ POINT_CLOUD_REGISTER_POINT_STRUCT(livox_ros::LivoxPointXyzrtl,
     (float, reflectivity, reflectivity)
     (uint8_t, tag, tag)
     (uint8_t, line, line)
+    (double, timestamp, timestamp)
 )
 
 POINT_CLOUD_REGISTER_POINT_STRUCT(livox_ros::LivoxPointXyzitl,
@@ -148,6 +151,7 @@ POINT_CLOUD_REGISTER_POINT_STRUCT(livox_ros::LivoxPointXyzitl,
     (float, intensity, intensity)
     (uint8_t, tag, tag)
     (uint8_t, line, line)
+    (double, timestamp, timestamp) // time ns
 )
 
 class Preprocess
@@ -157,7 +161,7 @@ class Preprocess
 
   Preprocess();
   ~Preprocess();
-  
+
   void process(const livox_ros_driver2::msg::CustomMsg::UniquePtr &msg, PointCloudXYZI::Ptr &pcl_out);
   void process(const sensor_msgs::msg::PointCloud2::UniquePtr &msg, PointCloudXYZI::Ptr &pcl_out);
   void set(bool feat_en, int lid_type, double bld, int pfilt_num);
@@ -183,7 +187,7 @@ private:
   int  plane_judge(const PointCloudXYZI &pl, vector<orgtype> &types, uint i, uint &i_nex, Eigen::Vector3d &curr_direct);
   bool small_plane(const PointCloudXYZI &pl, vector<orgtype> &types, uint i_cur, uint &i_nex, Eigen::Vector3d &curr_direct);
   bool edge_jump_judge(const PointCloudXYZI &pl, vector<orgtype> &types, uint i, Surround nor_dir);
-  
+
   int group_size;
   double disA, disB, inf_bound;
   double limit_maxmid, limit_midmin, limit_maxmin;

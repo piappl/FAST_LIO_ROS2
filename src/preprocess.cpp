@@ -1,3 +1,4 @@
+// clang-format off
 #include "preprocess.h"
 
 #include <pcl/common/common.h>
@@ -481,6 +482,7 @@ void Preprocess::mid360_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &
 
   pcl::PointCloud<livox_ros::LivoxPointXyzitl> pl_orig;
   pcl::fromROSMsg(*msg, pl_orig);
+  double ref_timestamp = static_cast<double>(static_cast<uint32_t>(msg->header.stamp.sec) * 1000000000UL + msg->header.stamp.nanosec);
   int plsize = pl_orig.points.size();
   if (plsize == 0)
     return;
@@ -517,37 +519,38 @@ void Preprocess::mid360_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &
     added_pt.y = pl_orig.points[i].y;
     added_pt.z = pl_orig.points[i].z;
     added_pt.intensity = pl_orig.points[i].intensity;
-    added_pt.curvature = 0.;
+    added_pt.curvature = (pl_orig.points[i].timestamp - ref_timestamp) / double(1000000); // ns -> ms
 
-    int layer = pl_orig.points[i].line;
-    double yaw_angle = atan2(added_pt.y, added_pt.x) * 57.2957;
+    // int layer = pl_orig.points[i].line;
+    // double yaw_angle = atan2(added_pt.y, added_pt.x) * 57.2957;
 
-    if (is_first[layer])
-    {
-      // printf("layer: %d; is first: %d", layer, is_first[layer]);
-      yaw_fp[layer] = yaw_angle;
-      is_first[layer] = false;
-      added_pt.curvature = 0.0;
-      yaw_last[layer] = yaw_angle;
-      time_last[layer] = added_pt.curvature;
-      continue;
-    }
+    // if (is_first[layer])
+    // {
+    //   // printf("layer: %d; is first: %d", layer, is_first[layer]);
+    //   yaw_fp[layer] = yaw_angle;
+    //   is_first[layer] = false;
+    //   // added_pt.curvature = 0.0; // it should be 0 already
+    //   yaw_last[layer] = yaw_angle;
+    //   time_last[layer] = added_pt.curvature;
+    //   continue;
+    // }
 
     // compute offset time
-    if (yaw_angle <= yaw_fp[layer])
-    {
-      added_pt.curvature = (yaw_fp[layer] - yaw_angle) / omega_l;
-    }
-    else
-    {
-      added_pt.curvature = (yaw_fp[layer] - yaw_angle + 360.0) / omega_l;
-    }
+    // already computed time offset
+    // if (yaw_angle <= yaw_fp[layer])
+    // {
+    //   added_pt.curvature = (yaw_fp[layer] - yaw_angle) / omega_l;
+    // }
+    // else
+    // {
+    //   added_pt.curvature = (yaw_fp[layer] - yaw_angle + 360.0) / omega_l;
+    // }
 
-    if (added_pt.curvature < time_last[layer])
-      added_pt.curvature += 360.0 / omega_l;
+    // if (added_pt.curvature < time_last[layer])
+    //   added_pt.curvature += 360.0 / omega_l;
 
-    yaw_last[layer] = yaw_angle;
-    time_last[layer] = added_pt.curvature;
+    // yaw_last[layer] = yaw_angle;
+    // time_last[layer] = added_pt.curvature;
 
     if (added_pt.x * added_pt.x + added_pt.y * added_pt.y + added_pt.z * added_pt.z > (blind * blind))
     {
