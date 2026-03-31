@@ -77,7 +77,7 @@ int    kdtree_size_st = 0, kdtree_size_end = 0, add_point_size = 0, kdtree_delet
 bool   runtime_pos_log = false, pcd_save_en = false, time_sync_en = false, extrinsic_est_en = true, path_en = true;
 /**************************/
 
-float res_last[100000] = {0.0};
+std::vector<float> res_last;
 float DET_RANGE = 300.0f;
 const float MOV_THRESHOLD = 1.5f;
 double time_diff_lidar_to_imu = 0.0;
@@ -95,7 +95,7 @@ double filter_size_corner_min = 0, filter_size_surf_min = 0, filter_size_map_min
 double cube_len = 0, HALF_FOV_COS = 0, FOV_DEG = 0, total_distance = 0, lidar_end_time = 0, first_lidar_time = 0.0;
 int    effct_feat_num = 0, time_log_counter = 0, scan_count = 0, publish_count = 0;
 int    iterCount = 0, feats_down_size = 0, NUM_MAX_ITERATIONS = 0, laserCloudValidNum = 0, pcd_save_interval = -1, pcd_index = 0;
-bool   point_selected_surf[100000] = {0};
+std::vector<uint8_t> point_selected_surf;
 bool   lidar_pushed, flg_first_scan = true, flg_exit = false, flg_EKF_inited;
 bool   scan_pub_en = false, dense_pub_en = false, scan_body_pub_en = false;
 bool   broadcast_tf = true;
@@ -114,9 +114,9 @@ PointCloudXYZI::Ptr featsFromMap(new PointCloudXYZI());
 PointCloudXYZI::Ptr feats_undistort(new PointCloudXYZI());
 PointCloudXYZI::Ptr feats_down_body(new PointCloudXYZI());
 PointCloudXYZI::Ptr feats_down_world(new PointCloudXYZI());
-PointCloudXYZI::Ptr normvec(new PointCloudXYZI(100000, 1));
-PointCloudXYZI::Ptr laserCloudOri(new PointCloudXYZI(100000, 1));
-PointCloudXYZI::Ptr corr_normvect(new PointCloudXYZI(100000, 1));
+PointCloudXYZI::Ptr normvec(new PointCloudXYZI());
+PointCloudXYZI::Ptr laserCloudOri(new PointCloudXYZI());
+PointCloudXYZI::Ptr corr_normvect(new PointCloudXYZI());
 PointCloudXYZI::Ptr _featsArray;
 
 pcl::VoxelGrid<PointType> downSizeFilterSurf;
@@ -155,6 +155,7 @@ void SigHandle(int sig)
 
 inline void dump_lio_state_to_log(FILE *fp)
 {
+    if (fp == nullptr) return;
     V3D rot_ang(Log(state_point.rot.toRotationMatrix()));
     fprintf(fp, "%lf ", Measures.lidar_beg_time - first_lidar_time);
     fprintf(fp, "%lf %lf %lf ", rot_ang(0), rot_ang(1), rot_ang(2));                   // Angle
@@ -335,7 +336,7 @@ void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
     if (time_sync_en && !timediff_set_flg && abs(last_timestamp_lidar - last_timestamp_imu) > 1 && !imu_buffer.empty())
     {
         timediff_set_flg = true;
-        timediff_lidar_wrt_imu = last_timestamp_lidar + 0.1 - last_timestamp_imu;
+        timediff_lidar_wrt_imu = last_timestamp_lidar + time_diff_lidar_to_imu - last_timestamp_imu;
         printf("Self sync IMU and LiDAR, time diff is %.10lf \n", timediff_lidar_wrt_imu);
     }
 
@@ -681,8 +682,6 @@ void publish_path(rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath)
 void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_data)
 {
     double match_start = omp_get_wtime();
-    laserCloudOri->clear();
-    corr_normvect->clear();
     total_residual = 0.0;
 
     /** closest surface search and residual computation **/
@@ -741,8 +740,8 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
     {
         if (point_selected_surf[i])
         {
-            laserCloudOri->points[effct_feat_num] = feats_down_body->points[i];
-            corr_normvect->points[effct_feat_num] = normvec->points[i];
+            laserCloudOri->push_back(feats_down_body->points[i]);
+            corr_normvect->push_back(normvec->points[i]);
             total_residual += res_last[i];
             effct_feat_num ++;
         }
@@ -895,12 +894,8 @@ public:
 
         _featsArray.reset(new PointCloudXYZI());
 
-        memset(point_selected_surf, true, sizeof(point_selected_surf));
-        memset(res_last, -1000.0f, sizeof(res_last));
         downSizeFilterSurf.setLeafSize(filter_size_surf_min, filter_size_surf_min, filter_size_surf_min);
         downSizeFilterMap.setLeafSize(filter_size_map_min, filter_size_map_min, filter_size_map_min);
-        memset(point_selected_surf, true, sizeof(point_selected_surf));
-        memset(res_last, -1000.0f, sizeof(res_last));
 
         Lidar_T_wrt_IMU<<VEC_FROM_ARRAY(extrinT);
         Lidar_R_wrt_IMU<<MAT_FROM_ARRAY(extrinR);
@@ -916,7 +911,11 @@ public:
         /*** debug record ***/
         // FILE *fp;
         string pos_log_dir = root_dir + "/Log/pos_log.txt";
-        fp = fopen(pos_log_dir.c_str(),"w");
+        fp = fopen(pos_log_dir.c_str(), "w");
+        if (fp == nullptr)
+        {
+            RCLCPP_ERROR(this->get_logger(), "Failed to open log file: %s", pos_log_dir.c_str());
+        }
 
         // ofstream fout_pre, fout_out, fout_dbg;
         fout_pre.open(DEBUG_FILE_DIR("mat_pre.txt"),ios::out);
@@ -961,7 +960,7 @@ public:
     {
         fout_out.close();
         fout_pre.close();
-        fclose(fp);
+        if (fp != nullptr) fclose(fp);
     }
 
 private:
@@ -990,7 +989,7 @@ private:
             state_point = kf.get_x();
             pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
 
-            if (feats_undistort->empty() || (feats_undistort == NULL))
+            if (feats_undistort == nullptr || feats_undistort->empty())
             {
                 RCLCPP_WARN(this->get_logger(), "No point, skip this scan!\n");
                 return;
@@ -1006,6 +1005,8 @@ private:
             downSizeFilterSurf.filter(*feats_down_body);
             t1 = omp_get_wtime();
             feats_down_size = feats_down_body->points.size();
+            res_last.assign(feats_down_size, 0.0f);
+            point_selected_surf.assign(feats_down_size, 1);
             /*** initialize the map kdtree ***/
             if(ikdtree.Root_Node == nullptr)
             {
@@ -1036,6 +1037,8 @@ private:
 
             normvec->resize(feats_down_size);
             feats_down_world->resize(feats_down_size);
+            laserCloudOri->clear();
+            corr_normvect->clear();
 
             V3D ext_euler = SO3ToEuler(state_point.offset_R_L_I);
             fout_pre<<setw(20)<<Measures.lidar_beg_time - first_lidar_time<<" "<<euler_cur.transpose()<<" "<< state_point.pos.transpose()<<" "<<ext_euler.transpose() << " "<<state_point.offset_T_L_I.transpose()<< " " << state_point.vel.transpose() \
