@@ -522,7 +522,8 @@ void Preprocess::mid360_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &
     added_pt.z = pl_orig.points[i].z;
     added_pt.intensity = pl_orig.points[i].intensity;
     added_pt.curvature = (pl_orig.points[i].timestamp - ref_timestamp) / double(1000000); // ns -> ms
-
+    added_pt.curvature = std::max(0.0f, added_pt.curvature); // clamp: negative offsets indicate timestamp error, but..
+                                                             // in this case its often some floating point error of first point
     // int layer = pl_orig.points[i].line;
     // double yaw_angle = atan2(added_pt.y, added_pt.x) * 57.2957;
 
