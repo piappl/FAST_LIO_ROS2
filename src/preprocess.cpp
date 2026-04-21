@@ -482,7 +482,7 @@ void Preprocess::mid360_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &
 
   pcl::PointCloud<livox_ros::LivoxPointXyzitl> pl_orig;
   pcl::fromROSMsg(*msg, pl_orig);
-  uint64_t ref_timestamp_ns = static_cast<uint64_t>(msg->header.stamp.sec) * 1000000000ULL + static_cast<uint64_t>(msg->header.stamp.nanosec);
+  double ref_timestamp = static_cast<double>(static_cast<uint32_t>(msg->header.stamp.sec) * 1000000000ULL + msg->header.stamp.nanosec);
   int plsize = pl_orig.points.size();
   if (plsize == 0)
     return;
@@ -511,7 +511,7 @@ void Preprocess::mid360_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &
 
   for (uint i = 0; i < plsize; ++i)
   {
-    if (i % point_filter_num != 0) continue;
+    // if (i % point_filter_num != 0) continue;
 
     PointType added_pt;
     added_pt.normal_x = 0;
@@ -521,9 +521,9 @@ void Preprocess::mid360_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &
     added_pt.y = pl_orig.points[i].y;
     added_pt.z = pl_orig.points[i].z;
     added_pt.intensity = pl_orig.points[i].intensity;
-    added_pt.curvature = static_cast<double>(static_cast<int64_t>(static_cast<uint64_t>(pl_orig.points[i].timestamp) - ref_timestamp_ns)) / 1000000.0; // ns -> ms
-    added_pt.curvature = std::max(0.0f, added_pt.curvature); // clamp: negative offsets indicate timestamp error
-
+    added_pt.curvature = (pl_orig.points[i].timestamp - ref_timestamp) / double(1000000); // ns -> ms
+    added_pt.curvature = std::max(0.0f, added_pt.curvature); // clamp: negative offsets indicate timestamp error, but..
+                                                             // in this case its often some floating point error of first point
     // int layer = pl_orig.points[i].line;
     // double yaw_angle = atan2(added_pt.y, added_pt.x) * 57.2957;
 
@@ -559,6 +559,20 @@ void Preprocess::mid360_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &
     {
       pl_surf.push_back(std::move(added_pt));
     }
+  }
+
+  // Temporary diagnostic — remove after confirming timestamps are healthy
+  if (!pl_surf.empty())
+  {
+    float c_max = 0.0f;
+    int zero_count = 0;
+    for (const auto& p : pl_surf.points)
+    {
+      if (p.curvature > c_max) c_max = p.curvature;
+      if (p.curvature == 0.0f) ++zero_count;
+    }
+    printf("[preprocess] pts=%zu  max_curv=%.2f ms  zeros=%d (%.0f%%)\n",
+           pl_surf.size(), c_max, zero_count, 100.0f * zero_count / pl_surf.size());
   }
 }
 

@@ -54,6 +54,7 @@
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
 #include <pcl/filters/voxel_grid.h>
+#include <pcl/filters/filter.h>
 #include <pcl/io/pcd_io.h>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <sensor_msgs/msg/imu.hpp>
@@ -995,6 +996,24 @@ private:
             state_point = kf.get_x();
             pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
 
+            /*** Detect and recover from NaN in EKF state ***/
+            if (!state_point.pos.allFinite() || !state_point.vel.allFinite() ||
+                !state_point.rot.coeffs().allFinite())
+            {
+                RCLCPP_ERROR(this->get_logger(),
+                             "NaN in EKF state (pos=[%.2f,%.2f,%.2f] vel=[%.2f,%.2f,%.2f]). "
+                             "Resetting IMU to recover.",
+                             state_point.pos[0], state_point.pos[1], state_point.pos[2],
+                             state_point.vel[0], state_point.vel[1], state_point.vel[2]);
+                state_ikfom safe_state = kf.get_x();
+                safe_state.pos.setZero();
+                safe_state.vel.setZero();
+                safe_state.rot = SO3();
+                kf.change_x(safe_state);
+                p_imu->Reset();
+                return;
+            }
+
             if (feats_undistort == nullptr || feats_undistort->empty())
             {
                 RCLCPP_WARN(this->get_logger(), "No point, skip this scan!\n");
@@ -1005,6 +1024,25 @@ private:
                             false : true;
             /*** Segment the map in lidar FOV ***/
             lasermap_fov_segment();
+
+            /*** remove NaN points produced by IMU undistortion before downsampl ing ***/
+            {
+            size_t before = feats_undistort->size();
+            feats_undistort->is_dense = false;  // force per-point NaN check (bypassed when is_dense=true)
+            std::vector<int> kept_indices;
+            pcl::removeNaNFromPointCloud(*feats_undistort, *feats_undistort, kept_indices);
+            size_t removed = before - feats_undistort->size();
+            if (removed > 0)
+            {
+                RCLCPP_WARN(this->get_logger(), "Removed %zu NaN points (of %zu) from undistorted cloud",removed, before);
+            }
+            }
+
+            if (feats_undistort->empty())
+            {
+                RCLCPP_WARN(this->get_logger(), "All points NaN after undistorti on, skip this scan!\n");
+                return;
+            }
 
             /*** downsample the feature points in a scan ***/
             downSizeFilterSurf.setInputCloud(feats_undistort);
@@ -1032,7 +1070,7 @@ private:
             int featsFromMapNum = ikdtree.validnum();
             kdtree_size_st = ikdtree.size();
 
-            // cout<<"[ mapping ]: In num: "<<feats_undistort->points.size()<<" downsamp "<<feats_down_size<<" Map num: "<<featsFromMapNum<<"effect num:"<<effct_feat_num<<endl;
+            cout<<"[ mapping ]: In num: "<<feats_undistort->points.size()<<" downsamp "<<feats_down_size<<" Map num: "<<featsFromMapNum<<"effect num:"<<effct_feat_num<<endl;
 
             /*** ICP and iterated Kalman filter update ***/
             if (feats_down_size < 5)
