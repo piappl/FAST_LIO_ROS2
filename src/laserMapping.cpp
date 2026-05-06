@@ -38,6 +38,7 @@
 #include <math.h>
 #include <thread>
 #include <fstream>
+#include <algorithm>
 #include <csignal>
 #include <chrono>
 #include <unistd.h>
@@ -77,7 +78,7 @@ int    kdtree_size_st = 0, kdtree_size_end = 0, add_point_size = 0, kdtree_delet
 bool   runtime_pos_log = false, pcd_save_en = false, time_sync_en = false, extrinsic_est_en = true, path_en = true;
 /**************************/
 
-float res_last[100000] = {0.0};
+std::vector<float> res_last;
 float DET_RANGE = 300.0f;
 const float MOV_THRESHOLD = 1.5f;
 double time_diff_lidar_to_imu = 0.0;
@@ -95,7 +96,7 @@ double filter_size_corner_min = 0, filter_size_surf_min = 0, filter_size_map_min
 double cube_len = 0, HALF_FOV_COS = 0, FOV_DEG = 0, total_distance = 0, lidar_end_time = 0, first_lidar_time = 0.0;
 int    effct_feat_num = 0, time_log_counter = 0, scan_count = 0, publish_count = 0;
 int    iterCount = 0, feats_down_size = 0, NUM_MAX_ITERATIONS = 0, laserCloudValidNum = 0, pcd_save_interval = -1, pcd_index = 0;
-bool   point_selected_surf[100000] = {0};
+std::vector<uint8_t> point_selected_surf;
 bool   lidar_pushed, flg_first_scan = true, flg_exit = false, flg_EKF_inited;
 bool   scan_pub_en = false, dense_pub_en = false, scan_body_pub_en = false;
 bool   broadcast_tf = true;
@@ -114,9 +115,9 @@ PointCloudXYZI::Ptr featsFromMap(new PointCloudXYZI());
 PointCloudXYZI::Ptr feats_undistort(new PointCloudXYZI());
 PointCloudXYZI::Ptr feats_down_body(new PointCloudXYZI());
 PointCloudXYZI::Ptr feats_down_world(new PointCloudXYZI());
-PointCloudXYZI::Ptr normvec(new PointCloudXYZI(100000, 1));
-PointCloudXYZI::Ptr laserCloudOri(new PointCloudXYZI(100000, 1));
-PointCloudXYZI::Ptr corr_normvect(new PointCloudXYZI(100000, 1));
+PointCloudXYZI::Ptr normvec(new PointCloudXYZI());
+PointCloudXYZI::Ptr laserCloudOri(new PointCloudXYZI());
+PointCloudXYZI::Ptr corr_normvect(new PointCloudXYZI());
 PointCloudXYZI::Ptr _featsArray;
 
 pcl::VoxelGrid<PointType> downSizeFilterSurf;
@@ -155,6 +156,7 @@ void SigHandle(int sig)
 
 inline void dump_lio_state_to_log(FILE *fp)
 {
+    if (fp == nullptr) return;
     V3D rot_ang(Log(state_point.rot.toRotationMatrix()));
     fprintf(fp, "%lf ", Measures.lidar_beg_time - first_lidar_time);
     fprintf(fp, "%lf %lf %lf ", rot_ang(0), rot_ang(1), rot_ang(2));                   // Angle
@@ -303,7 +305,7 @@ void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg)
     lidar_buffer.push_back(ptr);
     time_buffer.push_back(cur_time);
     last_timestamp_lidar = cur_time;
-    s_plot11[scan_count] = omp_get_wtime() - preprocess_start_time;
+    s_plot11[scan_count % MAXN] = omp_get_wtime() - preprocess_start_time;
     mtx_buffer.unlock();
     sig_buffer.notify_all();
 }
@@ -335,7 +337,7 @@ void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
     if (time_sync_en && !timediff_set_flg && abs(last_timestamp_lidar - last_timestamp_imu) > 1 && !imu_buffer.empty())
     {
         timediff_set_flg = true;
-        timediff_lidar_wrt_imu = last_timestamp_lidar + 0.1 - last_timestamp_imu;
+        timediff_lidar_wrt_imu = last_timestamp_lidar + time_diff_lidar_to_imu - last_timestamp_imu;
         printf("Self sync IMU and LiDAR, time diff is %.10lf \n", timediff_lidar_wrt_imu);
     }
 
@@ -344,7 +346,7 @@ void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
     lidar_buffer.push_back(ptr);
     time_buffer.push_back(last_timestamp_lidar);
 
-    s_plot11[scan_count] = omp_get_wtime() - preprocess_start_time;
+    s_plot11[scan_count % MAXN] = omp_get_wtime() - preprocess_start_time;
     mtx_buffer.unlock();
     sig_buffer.notify_all();
 }
@@ -398,15 +400,20 @@ bool sync_packages(MeasureGroup &meas)
             lidar_end_time = meas.lidar_beg_time + lidar_mean_scantime;
             std::cerr << "Too few input point cloud!\n";
         }
-        else if (meas.lidar->points.back().curvature / double(1000) < 0.5 * lidar_mean_scantime)
-        {
-            lidar_end_time = meas.lidar_beg_time + lidar_mean_scantime;
-        }
         else
         {
-            scan_num ++;
-            lidar_end_time = meas.lidar_beg_time + meas.lidar->points.back().curvature / double(1000);
-            lidar_mean_scantime += (meas.lidar->points.back().curvature / double(1000) - lidar_mean_scantime) / scan_num;
+            float max_curvature = std::max_element(meas.lidar->points.begin(), meas.lidar->points.end(),
+                [](const PointType &a, const PointType &b){ return a.curvature < b.curvature; })->curvature;
+            if (max_curvature / double(1000) < 0.5 * lidar_mean_scantime)
+            {
+                lidar_end_time = meas.lidar_beg_time + lidar_mean_scantime;
+            }
+            else
+            {
+                scan_num ++;
+                lidar_end_time = meas.lidar_beg_time + max_curvature / double(1000);
+                lidar_mean_scantime += (max_curvature / double(1000) - lidar_mean_scantime) / scan_num;
+            }
         }
 
         meas.lidar_end_time = lidar_end_time;
@@ -681,8 +688,6 @@ void publish_path(rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath)
 void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_data)
 {
     double match_start = omp_get_wtime();
-    laserCloudOri->clear();
-    corr_normvect->clear();
     total_residual = 0.0;
 
     /** closest surface search and residual computation **/
@@ -741,8 +746,8 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
     {
         if (point_selected_surf[i])
         {
-            laserCloudOri->points[effct_feat_num] = feats_down_body->points[i];
-            corr_normvect->points[effct_feat_num] = normvec->points[i];
+            laserCloudOri->push_back(feats_down_body->points[i]);
+            corr_normvect->push_back(normvec->points[i]);
             total_residual += res_last[i];
             effct_feat_num ++;
         }
@@ -895,12 +900,8 @@ public:
 
         _featsArray.reset(new PointCloudXYZI());
 
-        memset(point_selected_surf, true, sizeof(point_selected_surf));
-        memset(res_last, -1000.0f, sizeof(res_last));
         downSizeFilterSurf.setLeafSize(filter_size_surf_min, filter_size_surf_min, filter_size_surf_min);
         downSizeFilterMap.setLeafSize(filter_size_map_min, filter_size_map_min, filter_size_map_min);
-        memset(point_selected_surf, true, sizeof(point_selected_surf));
-        memset(res_last, -1000.0f, sizeof(res_last));
 
         Lidar_T_wrt_IMU<<VEC_FROM_ARRAY(extrinT);
         Lidar_R_wrt_IMU<<MAT_FROM_ARRAY(extrinR);
@@ -916,7 +917,11 @@ public:
         /*** debug record ***/
         // FILE *fp;
         string pos_log_dir = root_dir + "/Log/pos_log.txt";
-        fp = fopen(pos_log_dir.c_str(),"w");
+        fp = fopen(pos_log_dir.c_str(), "w");
+        if (fp == nullptr)
+        {
+            RCLCPP_ERROR(this->get_logger(), "Failed to open log file: %s", pos_log_dir.c_str());
+        }
 
         // ofstream fout_pre, fout_out, fout_dbg;
         fout_pre.open(DEBUG_FILE_DIR("mat_pre.txt"),ios::out);
@@ -961,7 +966,7 @@ public:
     {
         fout_out.close();
         fout_pre.close();
-        fclose(fp);
+        if (fp != nullptr) fclose(fp);
     }
 
 private:
@@ -990,7 +995,7 @@ private:
             state_point = kf.get_x();
             pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
 
-            if (feats_undistort->empty() || (feats_undistort == NULL))
+            if (feats_undistort == nullptr || feats_undistort->empty())
             {
                 RCLCPP_WARN(this->get_logger(), "No point, skip this scan!\n");
                 return;
@@ -1006,6 +1011,8 @@ private:
             downSizeFilterSurf.filter(*feats_down_body);
             t1 = omp_get_wtime();
             feats_down_size = feats_down_body->points.size();
+            res_last.assign(feats_down_size, 0.0f);
+            point_selected_surf.assign(feats_down_size, 1);
             /*** initialize the map kdtree ***/
             if(ikdtree.Root_Node == nullptr)
             {
@@ -1036,6 +1043,8 @@ private:
 
             normvec->resize(feats_down_size);
             feats_down_world->resize(feats_down_size);
+            laserCloudOri->clear();
+            corr_normvect->clear();
 
             V3D ext_euler = SO3ToEuler(state_point.offset_R_L_I);
             fout_pre<<setw(20)<<Measures.lidar_beg_time - first_lidar_time<<" "<<euler_cur.transpose()<<" "<< state_point.pos.transpose()<<" "<<ext_euler.transpose() << " "<<state_point.offset_T_L_I.transpose()<< " " << state_point.vel.transpose() \
@@ -1096,17 +1105,18 @@ private:
                 aver_time_incre = aver_time_incre * (frame_num - 1)/frame_num + (kdtree_incremental_time)/frame_num;
                 aver_time_solve = aver_time_solve * (frame_num - 1)/frame_num + (solve_time + solve_H_time)/frame_num;
                 aver_time_const_H_time = aver_time_const_H_time * (frame_num - 1)/frame_num + solve_time / frame_num;
-                T1[time_log_counter] = Measures.lidar_beg_time;
-                s_plot[time_log_counter] = t5 - t0;
-                s_plot2[time_log_counter] = feats_undistort->points.size();
-                s_plot3[time_log_counter] = kdtree_incremental_time;
-                s_plot4[time_log_counter] = kdtree_search_time;
-                s_plot5[time_log_counter] = kdtree_delete_counter;
-                s_plot6[time_log_counter] = kdtree_delete_time;
-                s_plot7[time_log_counter] = kdtree_size_st;
-                s_plot8[time_log_counter] = kdtree_size_end;
-                s_plot9[time_log_counter] = aver_time_consu;
-                s_plot10[time_log_counter] = add_point_size;
+                int log_idx = time_log_counter % MAXN;
+                T1[log_idx] = Measures.lidar_beg_time;
+                s_plot[log_idx] = t5 - t0;
+                s_plot2[log_idx] = feats_undistort->points.size();
+                s_plot3[log_idx] = kdtree_incremental_time;
+                s_plot4[log_idx] = kdtree_search_time;
+                s_plot5[log_idx] = kdtree_delete_counter;
+                s_plot6[log_idx] = kdtree_delete_time;
+                s_plot7[log_idx] = kdtree_size_st;
+                s_plot8[log_idx] = kdtree_size_end;
+                s_plot9[log_idx] = aver_time_consu;
+                s_plot10[log_idx] = add_point_size;
                 time_log_counter ++;
                 printf("[ mapping ]: time: IMU + Map + Input Downsample: %0.6f ave match: %0.6f ave solve: %0.6f  ave ICP: %0.6f  map incre: %0.6f ave total: %0.6f icp: %0.6f construct H: %0.6f \n",t1-t0,aver_time_match,aver_time_solve,t3-t1,t5-t3,aver_time_consu,aver_time_icp, aver_time_const_H_time);
                 ext_euler = SO3ToEuler(state_point.offset_R_L_I);

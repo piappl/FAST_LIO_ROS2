@@ -482,7 +482,7 @@ void Preprocess::mid360_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &
 
   pcl::PointCloud<livox_ros::LivoxPointXyzitl> pl_orig;
   pcl::fromROSMsg(*msg, pl_orig);
-  double ref_timestamp = static_cast<double>(static_cast<uint32_t>(msg->header.stamp.sec) * 1000000000UL + msg->header.stamp.nanosec);
+  double ref_timestamp = static_cast<double>(static_cast<uint32_t>(msg->header.stamp.sec) * 1000000000ULL + msg->header.stamp.nanosec);
   int plsize = pl_orig.points.size();
   if (plsize == 0)
     return;
@@ -511,6 +511,8 @@ void Preprocess::mid360_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &
 
   for (uint i = 0; i < plsize; ++i)
   {
+    // if (i % point_filter_num != 0) continue;
+
     PointType added_pt;
     added_pt.normal_x = 0;
     added_pt.normal_y = 0;
@@ -520,7 +522,8 @@ void Preprocess::mid360_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &
     added_pt.z = pl_orig.points[i].z;
     added_pt.intensity = pl_orig.points[i].intensity;
     added_pt.curvature = (pl_orig.points[i].timestamp - ref_timestamp) / double(1000000); // ns -> ms
-
+    added_pt.curvature = std::max(0.0f, added_pt.curvature); // clamp: negative offsets indicate timestamp error, but..
+                                                             // in this case its often some floating point error of first point
     // int layer = pl_orig.points[i].line;
     // double yaw_angle = atan2(added_pt.y, added_pt.x) * 57.2957;
 
