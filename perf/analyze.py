@@ -125,6 +125,141 @@ def slope_per_min(rows, tcol, vcol):
     return (num / den) * 60.0
 
 
+def discover_monitors(run):
+    """{tag: {meta, agg, events}} for every stream_monitor output in the dir."""
+    out = {}
+    try:
+        names = sorted(os.listdir(run))
+    except OSError:
+        return out
+    for fn in names:
+        if not fn.endswith("_meta.json") or fn == "resources_meta.json":
+            continue
+        tag = fn[: -len("_meta.json")]
+        meta = load_json(os.path.join(run, fn))
+        if meta is None:
+            continue
+        out[tag] = {
+            "meta": meta,
+            "agg": load_csv(os.path.join(run, f"{tag}_agg.csv")),
+            "events": load_csv(os.path.join(run, f"{tag}_events.csv")),
+        }
+    return out
+
+
+TS_EVENT_KINDS = ("timestamp_all_zero", "curvature_max_nonpositive",
+                  "timestamp_span_huge", "timestamp_negative",
+                  "no_timestamp_field", "timestamp_not_f64",
+                  "timestamp_parse_error", "timestamp_nonfinite",
+                  "empty_cloud", "short_cloud_buffer")
+
+
+def stream_checklist(monitors):
+    """
+    The Phase 1 table, computed. One block per monitor per topic, so you do not
+    have to cross-reference the console against three CSV columns by hand.
+    Returns True if every check passed.
+    """
+    all_ok = True
+    for tag in sorted(monitors):
+        m = monitors[tag]
+        meta, agg, evs = m["meta"], m["agg"] or [], m["events"] or []
+        print(f"\n  monitor '{tag}' (qos={meta.get('qos')}, "
+              f"{meta.get('duration_s')}s)")
+        pubs = meta.get("publishers") or {}
+        for t in meta.get("topics", []):
+            topic = t["topic"]
+            rows = [r for r in agg if r.get("topic") == topic]
+            is_cloud = any(fnum(r.get("points_mean")) is not None for r in rows)
+            print(f"    {topic}  ({'cloud' if is_cloud else 'imu'})")
+
+            checks = []
+
+            npub = pubs.get(topic, -1)
+            checks.append((
+                "exactly one publisher",
+                npub == 1,
+                f"pubs={npub}" + ("" if npub == 1 else
+                                  "  <-- FAST-LIO assumes ONE"),
+                npub in (-1, None),
+            ))
+
+            nom = t.get("nominal_hz") or 0
+            got = t.get("mean_hz") or 0
+            rate_ok = bool(nom) and abs(got - nom) <= 0.10 * nom
+            checks.append((
+                f"rate within 10% of {nom:g} Hz", rate_ok,
+                f"{got:.2f} Hz", not nom))
+
+            reg = t.get("stamp_regressions", 0)
+            checks.append(("no stamp regressions", reg == 0,
+                           f"regress={reg}" + ("" if reg == 0 else
+                                               "  <-- two sensors on one topic?"),
+                           False))
+            dup = t.get("stamp_duplicates", 0)
+            checks.append(("no duplicate stamps", dup == 0, f"dup={dup}", False))
+
+            # 'missed' is only meaningful once ordering is clean
+            if reg == 0:
+                loss = t.get("loss_pct_est", 0.0)
+                detail = f"missed~{t.get('missed_est')} ({loss}%)"
+                if loss < 0.5:
+                    st = True
+                elif loss < 2.0:
+                    # A software-timed publisher (fake_livox_pub.py, or a driver
+                    # that stamps on receipt) has a floor of a few tenths of a
+                    # percent from timer slip alone. Flag it, do not fail on it.
+                    st = "WARN"
+                    detail += "  <-- borderline; on a hardware-stamped sensor "
+                    detail += "investigate, on fake_livox_pub.py this is the "
+                    detail += "timer floor (try --gap-factor 2.0)"
+                else:
+                    st = False
+                checks.append(("estimated loss under 0.5%", st, detail, False))
+            else:
+                checks.append(("estimated loss", None,
+                               "NOT ASSESSABLE while regress>0 "
+                               "(out-of-order stamps inflate it)", True))
+
+            if is_cloud:
+                spans = col(rows, "off_span_ms_max")
+                zeros = col(rows, "zero_frac_max")
+                negs = col(rows, "neg_frac_max")
+                expect = 1000.0 / nom if nom else 100.0
+                if spans:
+                    ok = 0.5 * expect <= max(spans) <= 2.5 * expect
+                    checks.append((
+                        f"per-point span near {expect:.0f} ms", ok,
+                        f"off_span_ms_max={max(spans):.1f}", False))
+                else:
+                    checks.append(("per-point span", None,
+                                   "no per-point timestamps parsed", True))
+                if zeros:
+                    checks.append(("no zero point timestamps", max(zeros) == 0,
+                                   f"zero_frac_max={max(zeros)}", False))
+                if negs:
+                    checks.append(("few negative offsets", max(negs) <= 0.01,
+                                   f"neg_frac_max={max(negs)}", False))
+
+            nts = sum(1 for r in evs
+                      if r.get("topic") == topic and r.get("kind") in TS_EVENT_KINDS)
+            checks.append(("no timestamp anomaly events", nts == 0,
+                           f"{nts} events", False))
+
+            for label, ok, detail, unknown in checks:
+                if unknown or ok is None:
+                    mark = "  ?  "
+                elif ok == "WARN":
+                    mark = " WARN"
+                elif ok:
+                    mark = " PASS"
+                else:
+                    mark = " FAIL"
+                    all_ok = False
+                print(f"      [{mark}] {label:<34} {detail}")
+    return all_ok
+
+
 class Finding:
     def __init__(self, key, question):
         self.key = key
@@ -169,11 +304,17 @@ def main(argv):
                 k, v = line.rstrip("\n").split("=", 1)
                 info[k] = v
 
-    loam_meta = load_json(os.path.join(run, "loamqos_meta.json"))
-    greedy_meta = load_json(os.path.join(run, "greedy_meta.json"))
-    loam_ev = load_csv(os.path.join(run, "loamqos_events.csv"))
-    greedy_ev = load_csv(os.path.join(run, "greedy_events.csv"))
-    loam_agg = load_csv(os.path.join(run, "loamqos_agg.csv"))
+    # Any <tag>_meta.json is a stream_monitor run, so a directory produced with
+    # --tag phase1 (or any other tag) is analysable, not just the loamqos/greedy
+    # pair that run_test.sh happens to create.
+    monitors = discover_monitors(run)
+    loam_meta = (monitors.get("loamqos") or {}).get("meta")
+    greedy_meta = (monitors.get("greedy") or {}).get("meta")
+    loam_ev = (monitors.get("loamqos") or {}).get("events") or []
+    greedy_ev = (monitors.get("greedy") or {}).get("events") or []
+    loam_agg = (monitors.get("loamqos") or {}).get("agg") or []
+    # every monitor's events/agg, for the checks that do not need the A/B
+    all_ev = [e for m in monitors.values() for e in (m.get("events") or [])]
     res = load_csv(os.path.join(run, "resources.csv"))
     res_meta = load_json(os.path.join(run, "resources_meta.json"))
     probe = load_csv(os.path.join(run, "perf_probe_scan.csv"))
@@ -186,9 +327,8 @@ def main(argv):
               "proc_vanished_after_s"):
         if k in info:
             print(f"  {k:<24} {info[k]}")
-    have = [n for n, ok in (
-        ("loamqos monitor", bool(loam_meta)), ("greedy monitor", bool(greedy_meta)),
-        ("resources", bool(res)), ("probe", bool(probe))) if ok]
+    have = [f"monitor:{t}" for t in sorted(monitors)]
+    have += [n for n, ok in (("resources", bool(res)), ("probe", bool(probe))) if ok]
     print(f"  {'data present':<24} {', '.join(have) if have else 'NOTHING'}")
     if not have:
         print("\n  Nothing to analyse. Was the run dir written by run_test.sh?")
@@ -209,8 +349,10 @@ def main(argv):
             print(f"    {'':<26} gaps={t['gap_events']} missed~{t['missed_est']} "
                   f"(~{t['loss_pct_est']}%) regress={t['stamp_regressions']} "
                   f"dup={t['stamp_duplicates']}")
-    show_topics(loam_meta, "LOAM-QoS subscriber")
-    show_topics(greedy_meta, "greedy-QoS subscriber")
+    for tag in sorted(monitors):
+        label = {"loamqos": "LOAM-QoS subscriber",
+                 "greedy": "greedy-QoS subscriber"}.get(tag, f"monitor '{tag}'")
+        show_topics(monitors[tag]["meta"], label)
 
     if res_meta:
         print(f"  process RSS: first={res_meta.get('rss_first_mb')}MB "
@@ -246,15 +388,29 @@ def main(argv):
         kinds = Counter(r.get("kind", "?") for r in probe_ev)
         print("  probe events: " + ", ".join(f"{k}={v}" for k, v in
                                              kinds.most_common()))
-    if loam_ev or greedy_ev:
-        for evs, lab in ((loam_ev, "loamqos"), (greedy_ev, "greedy")):
-            if evs:
-                kinds = Counter(r.get("kind", "?") for r in evs)
-                print(f"  {lab} events: " + ", ".join(
-                    f"{k}={v}" for k, v in kinds.most_common()))
+    for tag in sorted(monitors):
+        evs = monitors[tag]["events"] or []
+        if evs:
+            kinds = Counter(r.get("kind", "?") for r in evs)
+            print(f"  {tag} events: " + ", ".join(
+                f"{k}={v}" for k, v in kinds.most_common()))
+
+    # ----------------------------------------------------- stream checklist --
+    # This is the Phase 1 table from perf/README.md, computed rather than left
+    # for you to cross-reference by hand.
+    title("2. sensor stream checklist (Phase 1 criteria)")
+    if monitors:
+        ok = stream_checklist(monitors)
+        print()
+        print("  ALL CHECKS PASSED -- the streams themselves are clean."
+              if ok else
+              "  AT LEAST ONE CHECK FAILED -- fix the stream before blaming LOAM.\n"
+              "  A '?' means the data could not answer it, not that it passed.")
+    else:
+        print("  no stream_monitor output in this directory")
 
     # ----------------------------------------------------------- hypotheses --
-    title("2. candidate root causes")
+    title("3. candidate root causes")
 
     findings = []
 
@@ -373,9 +529,8 @@ def main(argv):
     # ---- H3: two sensors on one topic / unsynced clocks ----
     f = mk("H3", "H3  Are two sensors publishing to ONE topic, or are their "
                  "clocks unsynchronised?")
-    for meta, lab in ((loam_meta, "loamqos"), (greedy_meta, "greedy")):
-        if not meta:
-            continue
+    for lab in sorted(monitors):
+        meta = monitors[lab]["meta"]
         for topic, npub in (meta.get("publishers") or {}).items():
             if isinstance(npub, (int, float)) and npub > 1:
                 f.set(LIKELY)
@@ -414,10 +569,9 @@ def main(argv):
                 "no_timestamp_field", "timestamp_not_f64",
                 "timestamp_parse_error", "timestamp_nonfinite")
     seen = Counter()
-    for evs in (loam_ev, greedy_ev):
-        for r in evs:
-            if r.get("kind") in ts_kinds:
-                seen[r["kind"]] += 1
+    for r in all_ev:
+        if r.get("kind") in ts_kinds:
+            seen[r["kind"]] += 1
     for k, v in seen.items():
         sev = LIKELY if k in ("timestamp_all_zero", "curvature_max_nonpositive",
                               "no_timestamp_field", "timestamp_span_huge") else POSSIBLE
@@ -430,9 +584,11 @@ def main(argv):
             f.add(f"probe: {bad} scans with an implausible duration "
                   "(lidar_end_time - lidar_beg_time), computed from "
                   "max(point curvature)")
-    if loam_agg:
-        spans = col(loam_agg, "off_span_ms_max")
-        zeros = col(loam_agg, "zero_frac_max")
+    any_agg = loam_agg or next((m["agg"] for m in monitors.values() if m["agg"]),
+                               [])
+    if any_agg:
+        spans = col(any_agg, "off_span_ms_max")
+        zeros = col(any_agg, "zero_frac_max")
         if spans:
             f.add(f"per-point offset span: max={max(spans):.1f}ms "
                   f"(a 10Hz sensor should be ~100ms)")
@@ -615,8 +771,8 @@ def main(argv):
     f = mk("H9", "H9  Is an ever-growing cloud being republished "
                  "(publish_map / pcl_wait_pub)?")
     # Direct evidence: a monitored cloud topic whose point count keeps climbing.
-    for agg, lab in ((loam_agg, "loamqos"),
-                     (load_csv(os.path.join(run, "greedy_agg.csv")), "greedy")):
+    for lab in sorted(monitors):
+        agg = monitors[lab]["agg"] or []
         if not agg:
             continue
         topics = {r["topic"] for r in agg if r.get("topic")}
@@ -663,7 +819,7 @@ def main(argv):
         fnd.render()
 
     # ------------------------------------------------------ final 30 seconds --
-    title("3. the last 30 s before the end")
+    title("4. the last 30 s before the end")
     end_t = None
     if probe:
         end_t = max(col(probe, "t_rel_s") or [0])
@@ -712,7 +868,7 @@ def main(argv):
                       f"{fnum(r.get('udp_rcvbuf_errors'), 0):>9.0f}")
 
     # ------------------------------------------------------------- next step --
-    title("4. what to do next")
+    title("5. what to do next")
     likely = [f for f in findings if f.verdict == LIKELY]
     possible = [f for f in findings if f.verdict == POSSIBLE]
     if likely:

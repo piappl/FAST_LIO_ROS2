@@ -84,6 +84,11 @@ struct ScanRecord
   double vel_norm = 0.0;
   double bg_norm = 0.0;
   double ba_norm = 0.0;
+
+  // Online-estimated LiDAR->IMU translation (state_point.offset_T_L_I). With
+  // mapping.extrinsic_est_en:true these converge to the sensor's true internal
+  // offset, so a run started from zeros MEASURES the extrinsic for you.
+  double ext_t_x = 0.0, ext_t_y = 0.0, ext_t_z = 0.0;
 };
 
 // -------------------------------------------------------------------- probe --
@@ -256,6 +261,7 @@ class Probe
         "%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,"     // stage timings ms
         "%lu,%lu,%lu,"                       // pts_in, pts_down, eff_feat
         "%.4f,%.4f,%.4f,%.5f,%.6f,%.6f,%d,"  // state
+        "%.5f,%.5f,%.5f,"                    // online extrinsic translation
         "%lu,%lu,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,"  // stream deltas
         "%.2f,"                              // rss_mb
         "%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu\n", // cumulative anomaly counters
@@ -272,6 +278,7 @@ class Probe
         r.pts_in, r.pts_down, r.eff_feat,
         r.pos_x, r.pos_y, r.pos_z, r.vel_norm, r.bg_norm, r.ba_norm,
         diverged ? 1 : 0,
+        r.ext_t_x, r.ext_t_y, r.ext_t_z,
         imu_n, lid_n, imu_gap, lid_gap, imu_lat, lid_lat, imu_dt, prep,
         rss_mb(),
         lidar_buf_max_.load(std::memory_order_relaxed),
@@ -346,6 +353,7 @@ class Probe
           "t_imu_ms,t_downsample_ms,t_icp_ms,t_incr_ms,t_publish_ms,t_total_ms,"
           "pts_in,pts_down,eff_feat,"
           "pos_x,pos_y,pos_z,vel_norm,bg_norm,ba_norm,nonfinite,"
+          "ext_t_x,ext_t_y,ext_t_z,"
           "imu_msgs_delta,lidar_msgs_delta,imu_cb_gap_max_ms,"
           "lidar_cb_gap_max_ms,imu_latency_max_ms,lidar_latency_max_ms,"
           "imu_stamp_dt_max_ms,preprocess_max_ms,rss_mb,"

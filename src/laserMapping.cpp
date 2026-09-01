@@ -1266,6 +1266,12 @@ private:
                 rec.vel_norm = state_point.vel.norm();
                 rec.bg_norm  = state_point.bg.norm();
                 rec.ba_norm  = state_point.ba.norm();
+                // online-estimated LiDAR->IMU translation; with
+                // mapping.extrinsic_est_en:true this converges to the sensor's
+                // true internal offset (see config/hap.yaml).
+                rec.ext_t_x = state_point.offset_T_L_I(0);
+                rec.ext_t_y = state_point.offset_T_L_I(1);
+                rec.ext_t_z = state_point.offset_T_L_I(2);
                 flperf::on_scan_done(rec);
             }
 

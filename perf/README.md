@@ -220,15 +220,55 @@ Start only the Livox driver, then:
   --out-dir perf/runs/phase1 --report-period 10
 ```
 
-Check:
+Let it run a few minutes, Ctrl-C, then get the verdict:
 
-| what | where | expected |
-|---|---|---|
-| exactly one publisher per topic | `pubs=` | **1** |
-| IMU rate | `hz` | ~200 |
-| stamp regressions | `stamp_regressions` | **0** |
-| per-point time span | `off_span_ms_max` | ~100 ms at 10 Hz |
-| points with `timestamp==0` | `zero_frac_max` | 0 |
+```bash
+./perf/analyze.py perf/runs/phase1
+```
+
+Section 2 of that report, **"sensor stream checklist"**, computes every Phase 1
+criterion per topic and marks each `PASS` / `WARN` / `FAIL` / `?`. That is the
+thing to read — you do not have to cross-reference the console against the CSVs
+by hand. A `?` means the data could not answer the question, *not* that it
+passed.
+
+#### Where the numbers actually live
+
+Only some of this is on the console. Three of the five criteria are file-only:
+
+| criterion | expected | console? | file |
+|---|---|---|---|
+| one publisher per topic | **1** | only as `!! N PUBLISHERS` when it is wrong | `publishers` in `phase1_meta.json`, `publishers` column in `phase1_agg.csv` |
+| IMU / cloud rate | ~200 / ~10 Hz | yes, `hz` | `hz` in `phase1_agg.csv` |
+| stamp regressions | **0** | only as `!! regress=N` | `stamp_regressions` in both |
+| per-point time span | ~100 ms at 10 Hz | **no** | `off_span_ms_max` in `phase1_agg.csv` |
+| points with `timestamp==0` | **0** | **no** | `zero_frac_max` in `phase1_agg.csv` |
+
+Note the asymmetry: `pubs=1` and `regress=0` never print on the console — silence
+is the pass. So a clean console does not confirm those two; the checklist does.
+
+Files written to `--out-dir`:
+
+```
+phase1_agg.csv      one row per topic per --report-period; all the columns above
+phase1_events.csv   one row per anomaly (gap, regression, timestamp problem)
+phase1_meta.json    totals, per-topic, plus the publisher count
+```
+
+Quick look without the analyser:
+
+```bash
+# the two cloud columns the console never shows
+python3 -c "
+import csv
+for r in csv.DictReader(open('perf/runs/phase1/phase1_agg.csv')):
+    if r['points_mean']:
+        print(r['t_rel_s'], 'pubs', r['publishers'], 'span', r['off_span_ms_max'],
+              'zero', r['zero_frac_max'], 'neg', r['neg_frac_max'])"
+
+# what went wrong, grouped
+tail -n +2 perf/runs/phase1/phase1_events.csv | cut -d, -f4 | sort | uniq -c | sort -rn
+```
 
 Any failure here is a driver/sensor/PTP problem and LOAM is downstream of it.
 Fix it before going on.
@@ -440,9 +480,40 @@ export FASTLIO_PERF_LOG=/path/to/prefix   # writes _scan.csv and _events.csv
 unset  FASTLIO_PERF_LOG                   # off; every hook is an inlined bool test
 ```
 
-It is already wired into `src/laserMapping.cpp` (15 call sites; `git diff` shows
-the whole change) and `CMakeLists.txt` adds the include path. Leaving it in the
-build costs nothing when the variable is unset.
+It is already wired into `src/laserMapping.cpp` (`git diff` shows the whole
+change) and `CMakeLists.txt` adds the include path. Leaving it in the build costs
+nothing when the variable is unset.
+
+### Measuring `extrinsic_T` instead of guessing it
+
+`extrinsic_T` is the LiDAR origin expressed in the IMU frame, in metres —
+verified against `pointBodyToWorld()`, which computes
+`p_imu = extrinsic_R * p_lidar + extrinsic_T`. If a datasheet gives you the IMU
+position *relative to the lidar origin*, that is the opposite direction: with
+`extrinsic_R = identity`, negate it.
+
+With `mapping.extrinsic_est_en: true` (the default when the key is absent)
+FAST-LIO estimates the three translation states online, so a run started from
+zeros measures the true offset for you. Read it back either way:
+
+```bash
+# from the probe CSV (lands in the run directory)
+python3 -c "
+import csv
+r=list(csv.DictReader(open('perf/runs/<run>/perf_probe_scan.csv')))[-1]
+print(r['ext_t_x'], r['ext_t_y'], r['ext_t_z'])"
+
+# or from the node's own log, written every scan regardless of the probe
+awk '{print \$11, \$12, \$13}' Log/mat_pre.txt | tail -20
+```
+
+`Log/mat_pre.txt` columns: `$1` time, `$2..$4` euler, `$5..$7` pos, `$8..$10`
+extrinsic rotation (euler), **`$11..$13` `offset_T_L_I`**, `$14..$16` vel,
+`$17..$19` bg, `$20..$22` ba, `$23..$25` grav.
+
+Let it converge over a minute or two of varied motion, pin the value, then set
+`extrinsic_est_en: false` — for crash diagnosis you want those six states fixed,
+so a timestamp fault cannot be absorbed as an apparent mounting error.
 
 ---
 
