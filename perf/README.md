@@ -273,7 +273,7 @@ which is usually where the answer is.
 
 | id | hypothesis | fix if confirmed |
 |---|---|---|
-| **H1** | loss at the subscriber (shallow QoS + starved single thread) | raise the IMU subscription depth well above 10 (200 Hz × worst stall); give the sensor callbacks their own `CallbackGroup` — **and add `mtx_buffer` locking to `sync_packages()` before introducing threads** |
+| **H1** | loss at the subscriber (shallow QoS + starved single thread) | raise the IMU subscription depth well above 10 (200 Hz × worst stall); give the sensor callbacks their own `CallbackGroup` — **and add `mtx_buffer` locking to `sync_packages()` before introducing threads**. Also raise `WhcHigh` (see below): a throttled reliable writer blocks `publish()` *on that same thread* |
 | **H2** | loss in the transport (socket buffers, NIC) | `perf/setup_target.sh` (raises `net.core.rmem_max`) plus `SocketReceiveBufferSize` in `perf/config/cyclonedds_jetson.xml`; jumbo frames on the lidar link if available |
 | **H3** | two sensors on one topic / unsynchronised clocks | one topic per sensor, or merge in a node that reorders by stamp; PTP both lidars off one master; point `imu_topic` at a single IMU |
 | **H4** | per-point timestamps corrupting `lidar_end_time` | fix the driver's timestamp mode; verify `off_span_ms_max` ≈ 100 ms; treat a non-positive `max(curvature)` as a hard error rather than clamping it |
@@ -288,13 +288,64 @@ which is usually where the answer is.
 | id | change | command |
 |---|---|---|
 | **E1** | no accumulating map | `--loam-cmd "... config_path:=$PWD/perf/config config_file:=mid360_perf_baseline.yaml"` |
-| **E2** | stock DDS vs tuned | `LOAM_PERF_DDS_URI= source perf/config/perf_env.sh` |
+| **E2** | DDS config, three ways | yours: `LOAM_PERF_DDS_URI=file://$PWD/perf/config/CycloneDDS.xml`; merged (default): plain `source perf/config/perf_env.sh`; stock: `LOAM_PERF_DDS_URI=` |
 | **E3** | no RViz (it subscribes to every cloud) | `rviz:=false` |
 | **E4** | decimate harder | `point_filter_num: 6` (or 8) |
 | **E5** | OpenMP residual loop on | `colcon build --packages-select fast_lio --cmake-args -DCMAKE_BUILD_TYPE=RelWithDebInfo -DFASTLIO_ENABLE_OPENMP_MP=ON -DFASTLIO_MP_PROC_NUM=4` |
 
 Change **one** thing per run and keep the run directories — they are all
 self-describing (`run_info.txt` records the config, env, and git revision).
+
+---
+
+## Your Cyclone DDS config vs the merged one
+
+`perf/config/CycloneDDS.xml` is what you had. `perf/config/cyclonedds_jetson.xml`
+is the merge; `perf_env.sh` points at the merge, and yours is preserved as the
+E2 baseline. Effective differences:
+
+| setting | yours | merged | why |
+|---|---|---|---|
+| `Interfaces/NetworkInterface` | `lo` | `lo` *(kept)* | loopback is the right call for a single box and better than the `autodetermine` originally proposed here: no NIC, no 1500-byte MTU, no IP fragmentation under 64 kB, no physical loss |
+| `Discovery/*` | `auto` / `1000` | *(kept)* | needed with this many participants on one host; the original proposal omitted it and was worse for it |
+| `Watermarks/WhcHigh` | **500 kB** | **8 MB** | **the consequential one** — see below |
+| `SocketReceiveBufferSize` | `min=10MB` | `min=10MB max=64MB` | `min` is what Cyclone accepts, `max` is what it *requests*; and either way `SO_RCVBUF` is capped by `net.core.rmem_max` (stock **212992**, i.e. ~1/50th of 10 MB), so run `setup_target.sh` or this element is decorative |
+| `FragmentSize` | *(unset → ~1344B default)* | `64000B` | 1344 is sized for Ethernet. On loopback it chops a 520 kB cloud into ~390 fragments for no benefit. **Only safe because of the `lo` binding** — revert to `1344B` if you ever unbind |
+| `Domain@id` | *(unset)* | `any` | no-op, `any` is the default; explicit for readability |
+
+### Why `WhcHigh: 500kB` matters
+
+`WhcHigh` is the writer history cache high-water mark. When a **reliable**
+writer's unacknowledged backlog crosses it, Cyclone throttles the writer:
+`write()` blocks until the reader catches up or `max_blocking_time` expires.
+
+Every FAST-LIO publisher is reliable — `create_publisher<PointCloud2>(topic, 20)`
+takes the rclcpp default. And one Mid-360 cloud is ~520 kB, i.e. **a single
+sample at or above your watermark**. Two Mid-360 merged is ~1 MB, over it. With
+`publish.map_en: true` the `/Laser_map` sample reaches 100 MB+ — 200x the
+watermark.
+
+So the writer throttles on essentially every publish. And `publish_frame_world()`
+is called from `timer_callback`, on the **same single executor thread** that must
+service `imu_cbk` at 200 Hz. A blocking write there starves IMU intake directly —
+which is cause 2 and cause 4, reached by a different route.
+
+`t_publish_ms` in `perf_probe_scan.csv` measures exactly this cost, so the A/B is
+already instrumented.
+
+### Confirm what you actually got
+
+Do not trust either file. Uncomment the `Tracing` block at the bottom of
+`cyclonedds_jetson.xml` (`Verbosity=config`) and run any node once:
+
+```bash
+CYCLONEDDS_URI=file://$PWD/perf/config/cyclonedds_jetson.xml RMW_IMPLEMENTATION=rmw_cyclonedds_cpp ros2 run demo_nodes_cpp talker
+grep -iE "rbuf|receive buffer|fragment|whc" /tmp/cyclonedds_config.log
+```
+
+Cyclone dumps the fully resolved configuration, including the socket buffer size
+it really obtained. That output is authoritative for your Cyclone version — the
+defaults quoted above are from memory and your build may differ.
 
 ---
 
@@ -308,7 +359,8 @@ perf/
 ├── analyze.py                     run directory -> verdict per hypothesis
 ├── config/
 │   ├── perf_env.sh                source this in every terminal
-│   ├── cyclonedds_jetson.xml      tuned Cyclone DDS config (buffers, fragments)
+│   ├── CycloneDDS.xml             YOUR existing config — kept as the A/B baseline
+│   ├── cyclonedds_jetson.xml      merged config: yours + the changes below
 │   ├── mid360_perf_baseline.yaml  control config: no accumulating map, no pcd
 │   ├── mid360_dual_perf.yaml      2x Mid-360 (read its header before using)
 │   └── hap_perf.yaml              1x HAP

@@ -177,20 +177,70 @@ fi
 if [ "$VALIDATE_DDS" -eq 1 ]; then
   bold ""
   bold "=== 6. Cyclone DDS config validation ==="
-  XML="$HERE/config/cyclonedds_jetson.xml"
+  XML="${CYCLONEDDS_URI#file://}"
+  [ -n "$XML" ] && [ -f "$XML" ] || XML="$HERE/config/cyclonedds_jetson.xml"
+  echo "  checking: $XML"
   python3 -c "import xml.dom.minidom,sys; xml.dom.minidom.parse('$XML')" \
     && ok "XML is well-formed" || { warn "XML is malformed"; exit 1; }
+
+  # The trap: SocketReceiveBufferSize can never exceed net.core.rmem_max, and
+  # Cyclone does not fail loudly when it silently gets less than asked for.
+  RMEM_MAX="$(sysctl -n net.core.rmem_max 2>/dev/null || echo 0)"
+  python3 - "$XML" "$RMEM_MAX" <<'PY'
+import re, sys, xml.etree.ElementTree as ET
+xml_path, rmem_max = sys.argv[1], int(sys.argv[2] or 0)
+
+def to_bytes(v):
+    m = re.fullmatch(r"\s*([0-9.]+)\s*([KkMmGg]?)[Bb]?\s*", v or "")
+    if not m:
+        return None
+    return int(float(m.group(1)) * {"": 1, "k": 1 << 10, "m": 1 << 20,
+                                    "g": 1 << 30}[m.group(2).lower()])
+
+root = ET.parse(xml_path).getroot()
+found = False
+for el in root.iter():
+    if el.tag.split("}")[-1] != "SocketReceiveBufferSize":
+        continue
+    found = True
+    for attr in ("min", "max"):
+        raw = el.attrib.get(attr)
+        if not raw:
+            print(f"    note: SocketReceiveBufferSize has no '{attr}' attribute")
+            continue
+        want = to_bytes(raw)
+        if want is None:
+            print(f"    note: could not parse {attr}={raw!r}")
+        elif rmem_max and want > rmem_max:
+            print(f"    !! {attr}={raw} ({want} B) EXCEEDS net.core.rmem_max "
+                  f"({rmem_max} B).")
+            print(f"    !! Cyclone cannot get that; the kernel will cap it. "
+                  f"Re-run setup_target.sh without --report-only.")
+        else:
+            print(f"    ok  {attr}={raw} fits under net.core.rmem_max "
+                  f"({rmem_max} B)")
+if not found:
+    print("    note: no SocketReceiveBufferSize element in this config")
+PY
   if [ -z "${ROS_DISTRO:-}" ]; then
     warn "ROS not sourced; skipping the live load test."
   else
     echo "  starting a throwaway node with CYCLONEDDS_URI set..."
     OUT="$(RMW_IMPLEMENTATION=rmw_cyclonedds_cpp CYCLONEDDS_URI="file://$XML" \
             timeout 12 ros2 run demo_nodes_cpp talker 2>&1 | head -25)"
-    if echo "$OUT" | grep -qiE "config|error|unknown element|not a valid"; then
-      warn "Cyclone complained -- comment out the offending element in the XML:"
+    if echo "$OUT" | grep -qi "RMW implementation not installed"; then
+      # Not a config problem at all: distinguish it, or the real message is lost.
+      warn "cannot test the config: rmw_cyclonedds_cpp is not installed."
+      warn "  sudo apt install ros-${ROS_DISTRO}-rmw-cyclonedds-cpp"
+    elif echo "$OUT" | grep -qiE "unknown element|not a valid|parse error|syntax error|invalid configuration|error in configuration"; then
+      warn "Cyclone rejected the config. Comment out the element it names:"
       echo "$OUT" | sed 's/^/    /'
+    elif echo "$OUT" | grep -qi "config" ; then
+      echo "  Cyclone printed config-related output; check it reads as expected:"
+      echo "$OUT" | grep -i config | sed 's/^/    /' | head -10
+      ok "no hard configuration error"
     else
-      ok "Cyclone accepted the config (no config errors on startup)"
+      ok "Cyclone accepted the config (no configuration error on startup)"
     fi
   fi
 fi

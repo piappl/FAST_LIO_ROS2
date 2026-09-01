@@ -1,33 +1,22 @@
 <?xml version="1.0" encoding="UTF-8" ?>
 <!--
-  Cyclone DDS tuning for FAST_LIO_ROS2 on Jetson Orin NX.
+  Cyclone DDS config for FAST_LIO_ROS2 on Jetson Orin NX.
 
-  WHY THIS FILE EXISTS
-  ────────────────────
-  A Mid-360 PointCloud2 frame is ~20k points x 26 B ≈ 520 kB; two of them
-  ≈ 1 MB, ten times a second. That is far above one UDP datagram, so Cyclone
-  fragments it. Every fragment must land in the subscriber's socket receive
-  buffer before the subscriber drains it. With stock settings the buffer is a
-  few hundred kB, so while laserMapping.cpp is busy in its 100 Hz
-  timer_callback (ICP + ikd-Tree, tens of ms) the buffer overflows and
-  fragments are dropped. A single lost fragment discards the WHOLE sample.
-  The same overflow hits the 200 Hz IMU stream, and a hole in the IMU stream
-  is what actually destroys the EKF.
+  This is a MERGE of perf/config/CycloneDDS.xml (your current setup) with the
+  changes this investigation calls for. Two things came from yours and are
+  kept because they are right: binding to the loopback interface, and the
+  Discovery block. Three things are changed. Each is annotated below.
 
-  Symptoms this addresses (watch resources.csv):
-    udp_rcvbuf_errors_per_s > 0     -> receive buffer overflowing
-    net_rx_dropped_per_s    > 0     -> NIC/kernel dropping
+  Keep perf/config/CycloneDDS.xml as-is: it is the A/B baseline (experiment E2).
 
-  IMPORTANT
-  ─────────
-  * SocketReceiveBufferSize can only reach what the kernel permits. Run
-    perf/setup_target.sh first (it raises net.core.rmem_max), otherwise
-    Cyclone silently gets less than requested.
-  * Cyclone DDS refuses to start on an unrecognised element and prints the
-    offending path. If your Cyclone build rejects something here, comment that
-    line out; `perf/setup_target.sh` with the validate-dds flag checks this for you.
-  * Set the interface name below if autodetermine picks the wrong NIC (the
-    Livox lidars usually sit on their own wired interface).
+  VERIFY WHAT YOU ACTUALLY GOT, do not trust this file:
+      CYCLONEDDS_URI=file://$PWD/perf/config/cyclonedds_jetson.xml \
+      RMW_IMPLEMENTATION=rmw_cyclonedds_cpp \
+      ros2 run demo_nodes_cpp talker 2>&1 | head -80
+  With Tracing/Verbosity=config (uncommented at the bottom) Cyclone dumps the
+  fully resolved configuration, including the socket buffer size it really
+  obtained. That output is authoritative for YOUR Cyclone version; the defaults
+  quoted in the comments below are from memory and may differ on your build.
 -->
 <CycloneDDS xmlns="https://cdds.io/config"
             xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
@@ -35,37 +24,100 @@
   <Domain id="any">
 
     <General>
-      <!-- Pin this to the NIC that carries ROS traffic if autodetect misfires,
-           e.g. <NetworkInterface name="eth0" priority="default" multicast="default"/> -->
+      <AllowMulticast>true</AllowMulticast>
+
+      <!-- KEPT FROM YOURS. Binding DDS to loopback is the right call for a
+           single-box rig and it is better than the autodetermine I originally
+           proposed: no NIC, no 1500-byte MTU, no IP fragmentation below 64 kB,
+           no physical packet loss, and a much cheaper send path.
+
+           Consequences to be aware of:
+             * nothing off-board can see the topics (no remote RViz, no remote
+               `ros2 topic echo`). Run RViz on the Jetson, or drop this element
+               for that session — and if you do, ALSO lower FragmentSize below
+               (see the note there), or you trade local speed for real loss.
+             * this does NOT touch the lidar->driver path. The Livox units send
+               raw UDP to a physical NIC; that traffic is not DDS and is not
+               affected by anything in this file. The sysctl work in
+               perf/setup_target.sh is what protects that path. -->
       <Interfaces>
-        <NetworkInterface autodetermine="true" priority="default" multicast="default"/>
+        <NetworkInterface name="lo" multicast="true" />
       </Interfaces>
 
-      <!-- Keep datagrams under the interface MTU so the IP layer never has to
-           fragment on top of Cyclone's own fragmentation. 1344 is safe for a
-           1500-byte MTU. If the lidar link runs jumbo frames (MTU 9000) you can
-           raise FragmentSize to ~8000 for a large throughput win. -->
-      <FragmentSize>1344B</FragmentSize>
       <MaxMessageSize>65500B</MaxMessageSize>
+
+      <!-- CHANGED (added; you had no FragmentSize, so you were on the default,
+           which is ~1344B sized for a 1500-byte Ethernet MTU).
+
+           On loopback the MTU is 65536, so that default makes Cyclone chop a
+           520 kB Mid-360 cloud into ~390 fragments and reassemble them, for no
+           benefit at all — there is no physical link to protect. One fragment
+           per datagram is dramatically cheaper.
+
+           NOTE the coupling: this value is only safe BECAUSE of the `lo`
+           binding above. On a real NIC a 64 kB datagram becomes ~44 IP
+           fragments and losing any one discards the whole sample. If you ever
+           unbind from `lo`, set this back to 1344B. -->
+      <FragmentSize>64000B</FragmentSize>
     </General>
 
     <Internal>
-      <!-- The critical knob: a deep socket receive buffer absorbs a full
-           point-cloud burst while the LOAM thread is busy. -->
-      <SocketReceiveBufferSize min="8MB" max="64MB"/>
+      <!-- CHANGED: added max. You had min="10MB" only.
 
-      <!-- Writer history high-water mark: lets a publisher buffer a backlog
-           instead of blocking (or dropping) when the reader stalls. -->
+           `min` is the size Cyclone will ACCEPT; `max` is what it REQUESTS from
+           the OS. With no `max`, the request is left at the OS default, and the
+           10MB then only acts as an assertion. More importantly, SO_RCVBUF is
+           capped by net.core.rmem_max, whose stock value is 212992 (208 kB) —
+           roughly 1/50th of what you asked for. So on an untuned Jetson your
+           10MB almost certainly is not being honoured, whatever the min/max
+           semantics turn out to be.
+
+           Run perf/setup_target.sh FIRST (it raises rmem_max to 32MB), then
+           confirm the achieved size in the Tracing/config dump. Without the
+           sysctl this element is decorative. -->
+      <SocketReceiveBufferSize min="10MB" max="64MB"/>
+
       <Watermarks>
+        <!-- CHANGED: 500kB -> 8MB. This is the most consequential difference.
+
+             WhcHigh is the writer history cache high-water mark. When a
+             RELIABLE writer's unacknowledged backlog exceeds it, Cyclone
+             THROTTLES the writer: write() blocks until the reader catches up or
+             max_blocking_time expires.
+
+             FAST-LIO's publishers are all reliable (create_publisher<...>(topic,
+             20) takes the rclcpp default). And one Mid-360 cloud is ~520 kB —
+             a single sample at or above a 500 kB watermark. Two Mid-360 merged
+             is ~1 MB, comfortably over it. With publish.map_en:true the
+             /Laser_map sample reaches 100 MB+, which is 200x the watermark.
+
+             So on essentially every publish, the writer throttles. And
+             publish_frame_world() is called from timer_callback — on the SAME
+             single executor thread that has to service imu_cbk at 200 Hz. A
+             blocking write there stalls IMU intake directly.
+
+             8MB gives several full frames of headroom. Measure the effect:
+             t_publish_ms in perf_probe_scan.csv is exactly this cost. -->
         <WhcHigh>8MB</WhcHigh>
       </Watermarks>
     </Internal>
 
-    <!-- Uncomment to capture a Cyclone-side trace. This is expensive; use it
-         only for a short targeted run, and expect a large file.
+    <!-- KEPT FROM YOURS, unchanged. My original config omitted this and was
+         worse for it: with unicast discovery on a single host, each participant
+         needs its own port index, and a LOAM + driver + RViz + monitors stack
+         is a lot of participants. -->
+    <Discovery>
+      <ParticipantIndex>auto</ParticipantIndex>
+      <MaxAutoParticipantIndex>1000</MaxAutoParticipantIndex>
+    </Discovery>
+
+    <!-- Uncomment for ONE short run to dump the resolved config and confirm the
+         socket buffer size actually obtained. Verbosity=config is cheap;
+         finest/trace is not, and will itself perturb timing. -->
+    <!--
     <Tracing>
-      <Category>config,discovery,throttle</Category>
-      <OutputFile>/tmp/cyclonedds_trace.log</OutputFile>
+      <Verbosity>config</Verbosity>
+      <OutputFile>/tmp/cyclonedds_config.log</OutputFile>
     </Tracing>
     -->
   </Domain>
