@@ -14,6 +14,7 @@
 #include <condition_variable>
 #include <nav_msgs/msg/odometry.hpp>
 #include <pcl/common/transforms.h>
+#include <rclcpp/rclcpp.hpp>
 #include <pcl/kdtree/kdtree_flann.h>
 #include <pcl_conversions/pcl_conversions.h>
 #include <sensor_msgs/msg/imu.hpp>
@@ -341,7 +342,9 @@ void ImuProcess::Process(const MeasureGroup &meas,  esekfom::esekf<state_ikfom, 
   double t1,t2,t3;
   t1 = omp_get_wtime();
 
-  if(meas.imu.empty()) {return;};
+  // Clear the output on every early return: cur_pcl_un_ still holds the PREVIOUS
+  // scan's cloud, and the caller would otherwise re-register it as a new scan.
+  if(meas.imu.empty()) { cur_pcl_un_->clear(); return; };
   assert(meas.lidar != nullptr);
 
   if (imu_need_init_)
@@ -356,17 +359,43 @@ void ImuProcess::Process(const MeasureGroup &meas,  esekfom::esekf<state_ikfom, 
     state_ikfom imu_state = kf_state.get_x();
     if (init_iter_num > MAX_INI_COUNT)
     {
+      V3D acc_std = cov_acc.cwiseSqrt();
+      V3D gyr_std = cov_gyr.cwiseSqrt();
+      double acc_std_ratio = acc_std.norm() / mean_acc.norm();
       cov_acc *= pow(G_m_s2 / mean_acc.norm(), 2);
       imu_need_init_ = false;
 
       cov_acc = cov_acc_scale;
       cov_gyr = cov_gyr_scale;
-      std::cout << "IMU Initial Done" << std::endl;
+      RCLCPP_INFO(rclcpp::get_logger("laser_mapping"),
+                  "IMU Initial Done: %d samples | gravity [%.3f %.3f %.3f] | |mean acc| %.4f (raw units) | "
+                  "gyro bias [%.4f %.4f %.4f] | acc std [%.4f %.4f %.4f] (%.1f%% of |acc|) | gyr std [%.4f %.4f %.4f]",
+                  init_iter_num - 1,
+                  imu_state.grav[0], imu_state.grav[1], imu_state.grav[2],
+                  mean_acc.norm(),
+                  mean_gyr(0), mean_gyr(1), mean_gyr(2),
+                  acc_std(0), acc_std(1), acc_std(2), acc_std_ratio * 100.0,
+                  gyr_std(0), gyr_std(1), gyr_std(2));
+      if (acc_std_ratio > 0.02)
+      {
+        RCLCPP_WARN(rclcpp::get_logger("laser_mapping"),
+                    "High accelerometer variance during IMU init (std = %.1f%% of gravity) — platform was likely "
+                    "moving or vibrating. Gravity/bias estimate may be wrong and the filter can diverge "
+                    "('No Effective Points'). Keep the platform still for the first seconds after launch.",
+                    acc_std_ratio * 100.0);
+      }
+      if (mean_gyr.norm() > 0.1)
+      {
+        RCLCPP_WARN(rclcpp::get_logger("laser_mapping"),
+                    "Large mean angular velocity during IMU init (%.3f rad/s) — platform was rotating; "
+                    "the gyro bias estimate is invalid.", mean_gyr.norm());
+      }
       // ROS_INFO("IMU Initial Done: Gravity: %.4f %.4f %.4f %.4f; state.bias_g: %.4f %.4f %.4f; acc covarience: %.8f %.8f %.8f; gry covarience: %.8f %.8f %.8f",\
       //          imu_state.grav[0], imu_state.grav[1], imu_state.grav[2], mean_acc.norm(), cov_bias_gyr[0], cov_bias_gyr[1], cov_bias_gyr[2], cov_acc[0], cov_acc[1], cov_acc[2], cov_gyr[0], cov_gyr[1], cov_gyr[2]);
       fout_imu.open(DEBUG_FILE_DIR("imu.txt"),ios::out);
     }
 
+    cur_pcl_un_->clear();
     return;
   }
 

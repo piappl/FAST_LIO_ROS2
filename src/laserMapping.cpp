@@ -97,6 +97,9 @@ double cube_len = 0, HALF_FOV_COS = 0, FOV_DEG = 0, total_distance = 0, lidar_en
 int    effct_feat_num = 0, time_log_counter = 0, scan_count = 0, publish_count = 0;
 int    iterCount = 0, feats_down_size = 0, NUM_MAX_ITERATIONS = 0, laserCloudValidNum = 0, pcd_save_interval = -1, pcd_index = 0;
 std::vector<uint8_t> point_selected_surf;
+// Diagnostics: why each downsampled point was rejected in h_share_model.
+// 0 = accepted, 1 = no close map neighbors, 2 = plane fit failed, 3 = residual score too low, 4 = not evaluated
+std::vector<uint8_t> point_reject_reason;
 bool   lidar_pushed, flg_first_scan = true, flg_exit = false, flg_EKF_inited;
 bool   scan_pub_en = false, dense_pub_en = false, scan_body_pub_en = false;
 bool   broadcast_tf = true;
@@ -292,7 +295,12 @@ void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg)
     double preprocess_start_time = omp_get_wtime();
     if (!is_first_lidar && cur_time < last_timestamp_lidar)
     {
-        std::cerr << "lidar loop back, clear buffer" << std::endl;
+        RCLCPP_ERROR(rclcpp::get_logger("laser_mapping"),
+                     "lidar loop back: stamp %.6f is %.3f s older than previous %.6f. "
+                     "Clearing lidar_buffer (%zu clouds) while time_buffer keeps %zu stamps "
+                     "-> cloud/timestamp pairing is DESYNCED from now on!",
+                     cur_time, last_timestamp_lidar - cur_time, last_timestamp_lidar,
+                     lidar_buffer.size(), time_buffer.size());
         lidar_buffer.clear();
     }
     if (is_first_lidar)
@@ -320,7 +328,12 @@ void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
     scan_count ++;
     if (!is_first_lidar && cur_time < last_timestamp_lidar)
     {
-        std::cerr << "lidar loop back, clear buffer" << std::endl;
+        RCLCPP_ERROR(rclcpp::get_logger("laser_mapping"),
+                     "lidar loop back: stamp %.6f is %.3f s older than previous %.6f. "
+                     "Clearing lidar_buffer (%zu clouds) while time_buffer keeps %zu stamps "
+                     "-> cloud/timestamp pairing is DESYNCED from now on!",
+                     cur_time, last_timestamp_lidar - cur_time, last_timestamp_lidar,
+                     lidar_buffer.size(), time_buffer.size());
         lidar_buffer.clear();
     }
     if(is_first_lidar)
@@ -371,7 +384,9 @@ void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in)
 
     if (timestamp < last_timestamp_imu)
     {
-        std::cerr << "lidar loop back, clear buffer" << std::endl;
+        RCLCPP_ERROR(rclcpp::get_logger("laser_mapping"),
+                     "imu loop back: stamp %.6f is %.3f s older than previous %.6f, clearing imu_buffer (%zu msgs)",
+                     timestamp, last_timestamp_imu - timestamp, last_timestamp_imu, imu_buffer.size());
         imu_buffer.clear();
     }
 
@@ -390,6 +405,18 @@ bool sync_packages(MeasureGroup &meas)
         return false;
     }
 
+    if (lidar_buffer.size() != time_buffer.size())
+    {
+        static int desync_warn_cnt = 0;
+        if (desync_warn_cnt++ % 100 == 0)
+        {
+            RCLCPP_ERROR(rclcpp::get_logger("laser_mapping"),
+                         "lidar_buffer (%zu) and time_buffer (%zu) sizes differ -> clouds are being paired "
+                         "with wrong timestamps, undistortion is broken until restart (seen %d times)",
+                         lidar_buffer.size(), time_buffer.size(), desync_warn_cnt);
+        }
+    }
+
     /*** push a lidar scan ***/
     if(!lidar_pushed)
     {
@@ -404,8 +431,27 @@ bool sync_packages(MeasureGroup &meas)
         {
             float max_curvature = std::max_element(meas.lidar->points.begin(), meas.lidar->points.end(),
                 [](const PointType &a, const PointType &b){ return a.curvature < b.curvature; })->curvature;
+            if (max_curvature <= 0.0f)
+            {
+                static int zero_offset_warn_cnt = 0;
+                if (zero_offset_warn_cnt++ % 100 == 0)
+                {
+                    RCLCPP_WARN(rclcpp::get_logger("laser_mapping"),
+                                "Per-point time offsets are all zero in this scan (%zu pts) — scan-end time and "
+                                "undistortion will be wrong (check driver/preprocess timestamp output, seen %d times)",
+                                meas.lidar->points.size(), zero_offset_warn_cnt);
+                }
+            }
             if (max_curvature / double(1000) < 0.5 * lidar_mean_scantime)
             {
+                static int endtime_fallback_warn_cnt = 0;
+                if (endtime_fallback_warn_cnt++ % 100 == 0)
+                {
+                    RCLCPP_WARN(rclcpp::get_logger("laser_mapping"),
+                                "Scan-end fallback: max point offset %.1f ms < half of mean scan time %.1f ms — "
+                                "point timestamps look inconsistent (seen %d times)",
+                                max_curvature, lidar_mean_scantime * 1000.0, endtime_fallback_warn_cnt);
+                }
                 lidar_end_time = meas.lidar_beg_time + lidar_mean_scantime;
             }
             else
@@ -440,6 +486,23 @@ bool sync_packages(MeasureGroup &meas)
     lidar_buffer.pop_front();
     time_buffer.pop_front();
     lidar_pushed = false;
+
+    if (meas.imu.empty())
+    {
+        RCLCPP_WARN(rclcpp::get_logger("laser_mapping"),
+                    "Synced package has 0 IMU samples for lidar span [%.6f, %.6f] — propagation will be skipped",
+                    meas.lidar_beg_time, lidar_end_time);
+    }
+    static bool first_sync_logged = false;
+    if (!first_sync_logged && !meas.imu.empty())
+    {
+        first_sync_logged = true;
+        RCLCPP_INFO(rclcpp::get_logger("laser_mapping"),
+                    "First synced package: lidar [%.6f, %.6f] (%.1f ms, %zu pts), %zu IMU msgs [%.6f, %.6f]",
+                    meas.lidar_beg_time, lidar_end_time, (lidar_end_time - meas.lidar_beg_time) * 1000.0,
+                    meas.lidar->points.size(), meas.imu.size(),
+                    get_time_sec(meas.imu.front()->header.stamp), get_time_sec(meas.imu.back()->header.stamp));
+    }
     return true;
 }
 
@@ -717,20 +780,24 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
             /** Find the closest surfaces in the map **/
             ikdtree.Nearest_Search(point_world, NUM_MATCH_POINTS, points_near, pointSearchSqDis);
             point_selected_surf[i] = points_near.size() < NUM_MATCH_POINTS ? false : pointSearchSqDis[NUM_MATCH_POINTS - 1] > 5 ? false : true;
+            if (!point_selected_surf[i]) point_reject_reason[i] = 1;
         }
 
         if (!point_selected_surf[i]) continue;
 
         VF(4) pabcd;
         point_selected_surf[i] = false;
+        point_reject_reason[i] = 2;
         if (esti_plane(pabcd, points_near, 0.1f))
         {
             float pd2 = pabcd(0) * point_world.x + pabcd(1) * point_world.y + pabcd(2) * point_world.z + pabcd(3);
             float s = 1 - 0.9 * fabs(pd2) / sqrt(p_body.norm());
 
+            point_reject_reason[i] = 3;
             if (s > 0.9)
             {
                 point_selected_surf[i] = true;
+                point_reject_reason[i] = 0;
                 normvec->points[i].x = pabcd(0);
                 normvec->points[i].y = pabcd(1);
                 normvec->points[i].z = pabcd(2);
@@ -753,11 +820,31 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
         }
     }
 
+    if (effct_feat_num < std::max(1, feats_down_size / 20))
+    {
+        static int low_match_warn_cnt = 0;
+        if (effct_feat_num < 1 || low_match_warn_cnt++ % 50 == 0)
+        {
+            int rej_search = 0, rej_plane = 0, rej_score = 0, rej_skipped = 0;
+            for (int i = 0; i < feats_down_size; i++)
+            {
+                if      (point_reject_reason[i] == 1) rej_search++;
+                else if (point_reject_reason[i] == 2) rej_plane++;
+                else if (point_reject_reason[i] == 3) rej_score++;
+                else if (point_reject_reason[i] == 4) rej_skipped++;
+            }
+            RCLCPP_WARN(rclcpp::get_logger("laser_mapping"),
+                        "%s %d/%d points effective | rejected: %d no close map neighbors (diverged or map too sparse), "
+                        "%d plane fit failed, %d residual too high, %d not evaluated | map: %d pts | est. pos [%.2f %.2f %.2f]",
+                        effct_feat_num < 1 ? "No Effective Points!" : "Low match ratio:",
+                        effct_feat_num, feats_down_size, rej_search, rej_plane, rej_score, rej_skipped,
+                        ikdtree.validnum(), s.pos(0), s.pos(1), s.pos(2));
+        }
+    }
+
     if (effct_feat_num < 1)
     {
         ekfom_data.valid = false;
-        std::cerr << "No Effective Points!" << std::endl;
-        // ROS_WARN("No Effective Points! \n");
         return;
     }
 
@@ -935,13 +1022,16 @@ public:
         /*** ROS subscribe initialization ***/
         if (p_pre->lidar_type == AVIA)
         {
-            sub_pcl_livox_ = this->create_subscription<livox_ros_driver2::msg::CustomMsg>(lid_topic, 20, livox_pcl_cbk);
+            sub_pcl_livox_ = this->create_subscription<livox_ros_driver2::msg::CustomMsg>(lid_topic, 100, livox_pcl_cbk);
         }
         else
         {
-            sub_pcl_pc_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(lid_topic, rclcpp::SensorDataQoS(), standard_pcl_cbk);
+            sub_pcl_pc_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(lid_topic, rclcpp::SensorDataQoS().keep_last(100), standard_pcl_cbk);
         }
-        sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(imu_topic, 10, imu_cbk);
+        // Deep queue: the executor is single-threaded, so while a scan is being processed
+        // (often >50 ms) incoming IMU msgs sit in the RMW queue. At 200 Hz a depth of 10
+        // holds only 50 ms and silently drops the rest.
+        sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(imu_topic, 1000, imu_cbk);
         pubLaserCloudFull_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered", 20);
         pubLaserCloudFull_body_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered_body", 20);
         pubLaserCloudEffect_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_effected", 20);
@@ -1013,6 +1103,7 @@ private:
             feats_down_size = feats_down_body->points.size();
             res_last.assign(feats_down_size, 0.0f);
             point_selected_surf.assign(feats_down_size, 1);
+            point_reject_reason.assign(feats_down_size, 4);
             /*** initialize the map kdtree ***/
             if(ikdtree.Root_Node == nullptr)
             {
@@ -1026,13 +1117,30 @@ private:
                         pointBodyToWorld(&(feats_down_body->points[i]), &(feats_down_world->points[i]));
                     }
                     ikdtree.Build(feats_down_world->points);
+                    RCLCPP_INFO(this->get_logger(),
+                                "Initial map built from %d downsampled points (raw scan: %zu pts). "
+                                "This map is never rebuilt — a bad first scan dooms the whole run.",
+                                feats_down_size, feats_undistort->points.size());
+                    if (feats_down_size < 100)
+                    {
+                        RCLCPP_WARN(this->get_logger(),
+                                    "Initial map is very sparse (%d pts) — likely a partial first scan from the driver; "
+                                    "matching may fail immediately", feats_down_size);
+                    }
+                }
+                else
+                {
+                    RCLCPP_WARN(this->get_logger(),
+                                "Map init skipped: only %d downsampled points in first usable scan", feats_down_size);
                 }
                 return;
             }
             int featsFromMapNum = ikdtree.validnum();
             kdtree_size_st = ikdtree.size();
 
-            // cout<<"[ mapping ]: In num: "<<feats_undistort->points.size()<<" downsamp "<<feats_down_size<<" Map num: "<<featsFromMapNum<<"effect num:"<<effct_feat_num<<endl;
+            RCLCPP_DEBUG(this->get_logger(),
+                         "[mapping] raw: %zu | downsampled: %d | map: %d pts | prev effective: %d | prev res mean: %.4f",
+                         feats_undistort->points.size(), feats_down_size, featsFromMapNum, effct_feat_num, res_mean_last);
 
             /*** ICP and iterated Kalman filter update ***/
             if (feats_down_size < 5)
@@ -1070,6 +1178,15 @@ private:
             double solve_H_time = 0;
             kf.update_iterated_dyn_share_modified(LASER_POINT_COV, solve_H_time);
             state_point = kf.get_x();
+            double pos_jump = (state_point.pos - position_last).norm();
+            if (flg_EKF_inited && pos_jump > 1.0)
+            {
+                RCLCPP_WARN(this->get_logger(),
+                            "Pose jumped %.2f m in one scan — filter likely diverging. pos [%.2f %.2f %.2f], vel [%.2f %.2f %.2f]",
+                            pos_jump, state_point.pos(0), state_point.pos(1), state_point.pos(2),
+                            state_point.vel(0), state_point.vel(1), state_point.vel(2));
+            }
+            position_last = state_point.pos;
             euler_cur = SO3ToEuler(state_point.rot);
             pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
             geoQuat.x = state_point.rot.coeffs()[0];
