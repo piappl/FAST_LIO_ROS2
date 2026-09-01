@@ -214,13 +214,23 @@ for el in root.iter():
         elif rmem_max and want > rmem_max:
             print(f"    !! {attr}={raw} ({want} B) EXCEEDS net.core.rmem_max "
                   f"({rmem_max} B).")
-            print(f"    !! Cyclone cannot get that; the kernel will cap it. "
-                  f"Re-run setup_target.sh without --report-only.")
+            print(f"    !! Cyclone will warn: 'failed to increase socket receive "
+                  f"buffer size'.")
+            print(f"    !! Fix:  sudo sysctl -w net.core.rmem_max={max(want, 33554432)}")
         else:
             print(f"    ok  {attr}={raw} fits under net.core.rmem_max "
                   f"({rmem_max} B)")
 if not found:
     print("    note: no SocketReceiveBufferSize element in this config")
+else:
+    # Reading Cyclone's numbers: Linux stores 2x the requested SO_RCVBUF (the
+    # extra is bookkeeping overhead) and getsockopt reports the doubled value,
+    # while net.core.rmem_max caps the value BEFORE doubling. So the size
+    # Cyclone reports as "current" is roughly 2 * min(requested, rmem_max) --
+    # e.g. "current is 2097152" means rmem_max is about 1 MB, not 2 MB.
+    print("    note: Cyclone's reported size is ~2x min(request, rmem_max);")
+    print("          Linux doubles SO_RCVBUF internally. 'current is 2097152'")
+    print("          therefore means rmem_max is ~1MB.")
 PY
   if [ -z "${ROS_DISTRO:-}" ]; then
     warn "ROS not sourced; skipping the live load test."

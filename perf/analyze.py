@@ -285,6 +285,15 @@ def main(argv):
             f.add(f"{topic}: loamqos missed~{a['missed_est']} "
                   f"({a['loss_pct_est']}%) vs greedy missed~{b['missed_est']} "
                   f"({b['loss_pct_est']}%)")
+            if a["stamp_regressions"] > 0 or b["stamp_regressions"] > 0:
+                # Out-of-order stamps make every backward jump produce an
+                # oversized forward jump, which the gap estimator counts as a
+                # gap. The loam-vs-greedy RATIO survives (both are inflated the
+                # same way); the absolute percentage does not.
+                f.add(f"  CAVEAT: {topic} had stamp regressions, which inflate "
+                      "'missed'. Treat the absolute loss % as unreliable and fix "
+                      "ordering first (see H3); the loamqos-vs-greedy ratio is "
+                      "still meaningful.")
             if a["missed_est"] > 5 and a["missed_est"] > 3 * max(b["missed_est"], 1):
                 f.set(LIKELY)
                 f.add("  -> the deep-QoS reader saw the data the LOAM-QoS reader "

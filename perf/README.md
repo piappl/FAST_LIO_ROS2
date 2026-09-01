@@ -181,9 +181,35 @@ You should see `stamp_regression` and `stamp_gap` events, and with
 it once clean (no flags) to see the false-positive floor. Now you know what a
 real detection looks like.
 
-> Note: `fake_livox_pub.py` stamps messages from a Python timer, so a "clean" run
-> still shows ~1% spurious `stamp_gap` on the 200 Hz IMU. Real Livox stamps are
-> hardware-derived and much more regular. Tune with `--gap-factor` if needed.
+#### How to read those numbers
+
+**`missed` is only trustworthy when `regress` is 0.** The gap estimator works on
+stamp deltas, so an out-of-order stream confounds it: every backward jump is
+followed by an oversized forward jump, which counts as a gap. With
+`--second-imu-publisher` you get `gap_events ≈ regressions`, one for one, and
+`missed` inflated to roughly that same number — even though nothing was actually
+lost. Measured on the reference run: 4196 regressions, 4195 gaps, and a
+`missed` estimate ~10% above the gap count, where the ~10% excess is the *real*
+`--drop-imu-frac` loss.
+
+So read the columns in this order:
+
+1. **`pubs=`** — more than 1 invalidates everything below it.
+2. **`regress`** — if non-zero, fix ordering before believing any loss figure.
+3. **`missed`** — only now does it mean loss.
+
+To measure real loss independently of ordering, compare the rate the monitor
+*received* against what the publisher (or driver) says it *sent*. On the
+reference run that was 368.58 Hz sent vs 368.07 Hz received: **0.14%**, i.e. no
+transport loss at all, despite `missed` reporting ~35%.
+
+> Note: `fake_livox_pub.py` stamps messages from a Python timer, so even a clean
+> run shows a small spurious `stamp_gap` count on the 200 Hz IMU — measured floor
+> is ~0.25% (11 gaps in 4335 messages), and it is higher on a slower box because
+> the Python timer slips more. Real Livox stamps are hardware-derived and far
+> more regular. Raise `--gap-factor` if the floor is noisy on your target.
+> A clean run must show **`regress=0`** and **zero timestamp events** — those have
+> no false-positive floor.
 
 ### Phase 1 — is the sensor stream itself clean? (driver only, no LOAM)
 
@@ -288,7 +314,7 @@ which is usually where the answer is.
 | id | change | command |
 |---|---|---|
 | **E1** | no accumulating map | `--loam-cmd "... config_path:=$PWD/perf/config config_file:=mid360_perf_baseline.yaml"` |
-| **E2** | DDS config, three ways | yours: `LOAM_PERF_DDS_URI=file://$PWD/perf/config/CycloneDDS.xml`; merged (default): plain `source perf/config/perf_env.sh`; stock: `LOAM_PERF_DDS_URI=` |
+| **E2** | DDS config, three ways | merged (default): plain `source perf/config/perf_env.sh`; stock: `LOAM_PERF_DDS_URI=`; pre-merge baseline: write the snippet below to `perf/config/CycloneDDS.xml` and set `LOAM_PERF_DDS_URI=file://$PWD/perf/config/CycloneDDS.xml` |
 | **E3** | no RViz (it subscribes to every cloud) | `rviz:=false` |
 | **E4** | decimate harder | `point_filter_num: 6` (or 8) |
 | **E5** | OpenMP residual loop on | `colcon build --packages-select fast_lio --cmake-args -DCMAKE_BUILD_TYPE=RelWithDebInfo -DFASTLIO_ENABLE_OPENMP_MP=ON -DFASTLIO_MP_PROC_NUM=4` |
@@ -300,9 +326,10 @@ self-describing (`run_info.txt` records the config, env, and git revision).
 
 ## Your Cyclone DDS config vs the merged one
 
-`perf/config/CycloneDDS.xml` is what you had. `perf/config/cyclonedds_jetson.xml`
-is the merge; `perf_env.sh` points at the merge, and yours is preserved as the
-E2 baseline. Effective differences:
+`perf/config/cyclonedds_jetson.xml` is the merge of the pre-existing config with
+the changes below; `perf_env.sh` points at it. The pre-merge config is reproduced
+at the end of this section so experiment E2 stays runnable. Effective
+differences:
 
 | setting | yours | merged | why |
 |---|---|---|---|
@@ -347,6 +374,35 @@ Cyclone dumps the fully resolved configuration, including the socket buffer size
 it really obtained. That output is authoritative for your Cyclone version — the
 defaults quoted above are from memory and your build may differ.
 
+### The pre-merge config (E2 baseline)
+
+Save as `perf/config/CycloneDDS.xml` when you want to A/B against it:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<CycloneDDS>
+  <Domain>
+    <General>
+      <AllowMulticast>true</AllowMulticast>
+      <Interfaces>
+        <NetworkInterface name="lo" multicast="true" />
+      </Interfaces>
+      <MaxMessageSize>65500B</MaxMessageSize>
+    </General>
+    <Internal>
+      <SocketReceiveBufferSize min="10MB" />
+      <Watermarks>
+        <WhcHigh>500kB</WhcHigh>
+      </Watermarks>
+    </Internal>
+    <Discovery>
+      <ParticipantIndex>auto</ParticipantIndex>
+      <MaxAutoParticipantIndex>1000</MaxAutoParticipantIndex>
+    </Discovery>
+  </Domain>
+</CycloneDDS>
+```
+
 ---
 
 ## Files
@@ -359,8 +415,7 @@ perf/
 ├── analyze.py                     run directory -> verdict per hypothesis
 ├── config/
 │   ├── perf_env.sh                source this in every terminal
-│   ├── CycloneDDS.xml             YOUR existing config — kept as the A/B baseline
-│   ├── cyclonedds_jetson.xml      merged config: yours + the changes below
+│   ├── cyclonedds_jetson.xml      merged config (see the comparison section)
 │   ├── mid360_perf_baseline.yaml  control config: no accumulating map, no pcd
 │   ├── mid360_dual_perf.yaml      2x Mid-360 (read its header before using)
 │   └── hap_perf.yaml              1x HAP
