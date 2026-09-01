@@ -1,0 +1,72 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!--
+  Cyclone DDS tuning for FAST_LIO_ROS2 on Jetson Orin NX.
+
+  WHY THIS FILE EXISTS
+  ────────────────────
+  A Mid-360 PointCloud2 frame is ~20k points x 26 B ≈ 520 kB; two of them
+  ≈ 1 MB, ten times a second. That is far above one UDP datagram, so Cyclone
+  fragments it. Every fragment must land in the subscriber's socket receive
+  buffer before the subscriber drains it. With stock settings the buffer is a
+  few hundred kB, so while laserMapping.cpp is busy in its 100 Hz
+  timer_callback (ICP + ikd-Tree, tens of ms) the buffer overflows and
+  fragments are dropped. A single lost fragment discards the WHOLE sample.
+  The same overflow hits the 200 Hz IMU stream, and a hole in the IMU stream
+  is what actually destroys the EKF.
+
+  Symptoms this addresses (watch resources.csv):
+    udp_rcvbuf_errors_per_s > 0     -> receive buffer overflowing
+    net_rx_dropped_per_s    > 0     -> NIC/kernel dropping
+
+  IMPORTANT
+  ─────────
+  * SocketReceiveBufferSize can only reach what the kernel permits. Run
+    perf/setup_target.sh first (it raises net.core.rmem_max), otherwise
+    Cyclone silently gets less than requested.
+  * Cyclone DDS refuses to start on an unrecognised element and prints the
+    offending path. If your Cyclone build rejects something here, comment that
+    line out; `perf/setup_target.sh` with the validate-dds flag checks this for you.
+  * Set the interface name below if autodetermine picks the wrong NIC (the
+    Livox lidars usually sit on their own wired interface).
+-->
+<CycloneDDS xmlns="https://cdds.io/config"
+            xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+            xsi:schemaLocation="https://cdds.io/config https://raw.githubusercontent.com/eclipse-cyclonedds/cyclonedds/master/etc/cyclonedds.xsd">
+  <Domain id="any">
+
+    <General>
+      <!-- Pin this to the NIC that carries ROS traffic if autodetect misfires,
+           e.g. <NetworkInterface name="eth0" priority="default" multicast="default"/> -->
+      <Interfaces>
+        <NetworkInterface autodetermine="true" priority="default" multicast="default"/>
+      </Interfaces>
+
+      <!-- Keep datagrams under the interface MTU so the IP layer never has to
+           fragment on top of Cyclone's own fragmentation. 1344 is safe for a
+           1500-byte MTU. If the lidar link runs jumbo frames (MTU 9000) you can
+           raise FragmentSize to ~8000 for a large throughput win. -->
+      <FragmentSize>1344B</FragmentSize>
+      <MaxMessageSize>65500B</MaxMessageSize>
+    </General>
+
+    <Internal>
+      <!-- The critical knob: a deep socket receive buffer absorbs a full
+           point-cloud burst while the LOAM thread is busy. -->
+      <SocketReceiveBufferSize min="8MB" max="64MB"/>
+
+      <!-- Writer history high-water mark: lets a publisher buffer a backlog
+           instead of blocking (or dropping) when the reader stalls. -->
+      <Watermarks>
+        <WhcHigh>8MB</WhcHigh>
+      </Watermarks>
+    </Internal>
+
+    <!-- Uncomment to capture a Cyclone-side trace. This is expensive; use it
+         only for a short targeted run, and expect a large file.
+    <Tracing>
+      <Category>config,discovery,throttle</Category>
+      <OutputFile>/tmp/cyclonedds_trace.log</OutputFile>
+    </Tracing>
+    -->
+  </Domain>
+</CycloneDDS>

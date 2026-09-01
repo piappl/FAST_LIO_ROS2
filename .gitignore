@@ -6,3 +6,8 @@ Log/*.pdf
 .vscode/c_cpp_properties.json
 .vscode/settings.json
 PCD/*.pcd
+
+# perf test output (see perf/README.md)
+perf/runs/*
+!perf/runs/.gitkeep
+__pycache__/

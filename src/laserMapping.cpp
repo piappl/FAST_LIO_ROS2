@@ -64,6 +64,8 @@
 #include <livox_ros_driver2/msg/custom_msg.hpp>
 #include "preprocess.h"
 #include <ikd-Tree/ikd_Tree.h>
+// Opt-in performance/crash probe. No-op unless FASTLIO_PERF_LOG is set.
+#include "perf_probe.hpp"
 
 #define INIT_TIME           (0.1)
 #define LASER_POINT_COV     (0.001)
@@ -302,6 +304,7 @@ void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg)
                      cur_time, last_timestamp_lidar - cur_time, last_timestamp_lidar,
                      lidar_buffer.size(), time_buffer.size());
         lidar_buffer.clear();
+        flperf::on_buffer_clear("lidar_buffer/standard_pcl_cbk");
     }
     if (is_first_lidar)
     {
@@ -314,6 +317,8 @@ void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg)
     time_buffer.push_back(cur_time);
     last_timestamp_lidar = cur_time;
     s_plot11[scan_count % MAXN] = omp_get_wtime() - preprocess_start_time;
+    flperf::on_lidar_msg(cur_time, (unsigned long)ptr->points.size(),
+                         omp_get_wtime() - preprocess_start_time);
     mtx_buffer.unlock();
     sig_buffer.notify_all();
 }
@@ -335,6 +340,7 @@ void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
                      cur_time, last_timestamp_lidar - cur_time, last_timestamp_lidar,
                      lidar_buffer.size(), time_buffer.size());
         lidar_buffer.clear();
+        flperf::on_buffer_clear("lidar_buffer/livox_pcl_cbk");
     }
     if(is_first_lidar)
     {
@@ -360,6 +366,8 @@ void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
     time_buffer.push_back(last_timestamp_lidar);
 
     s_plot11[scan_count % MAXN] = omp_get_wtime() - preprocess_start_time;
+    flperf::on_lidar_msg(last_timestamp_lidar, (unsigned long)ptr->points.size(),
+                         omp_get_wtime() - preprocess_start_time);
     mtx_buffer.unlock();
     sig_buffer.notify_all();
 }
@@ -388,18 +396,20 @@ void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in)
                      "imu loop back: stamp %.6f is %.3f s older than previous %.6f, clearing imu_buffer (%zu msgs)",
                      timestamp, last_timestamp_imu - timestamp, last_timestamp_imu, imu_buffer.size());
         imu_buffer.clear();
+        flperf::on_buffer_clear("imu_buffer/imu_cbk");
     }
 
     last_timestamp_imu = timestamp;
 
     imu_buffer.push_back(msg);
+    flperf::on_imu_msg(timestamp);
     mtx_buffer.unlock();
     sig_buffer.notify_all();
 }
 
 double lidar_mean_scantime = 0.0;
 int    scan_num = 0;
-bool sync_packages(MeasureGroup &meas)
+static bool sync_packages_impl(MeasureGroup &meas)
 {
     if (lidar_buffer.empty() || imu_buffer.empty()) {
         return false;
@@ -504,6 +514,26 @@ bool sync_packages(MeasureGroup &meas)
                     get_time_sec(meas.imu.front()->header.stamp), get_time_sec(meas.imu.back()->header.stamp));
     }
     return true;
+}
+
+// Thin wrapper so the probe sees every sync attempt -- success or stall --
+// without touching sync_packages_impl's four return paths.
+// NOTE: on a stall, lidar_beg_time/lidar_end_time may still hold the previous
+// scan's values; only the buffer depths and the IMU lag are meaningful there.
+bool sync_packages(MeasureGroup &meas)
+{
+    const bool ok = sync_packages_impl(meas);
+    if (flperf::enabled())
+    {
+        flperf::on_sync(ok,
+                        (unsigned long)lidar_buffer.size(),
+                        (unsigned long)imu_buffer.size(),
+                        (unsigned long)time_buffer.size(),
+                        (unsigned long)meas.imu.size(),
+                        meas.lidar_beg_time, meas.lidar_end_time,
+                        last_timestamp_imu);
+    }
+    return ok;
 }
 
 int process_increments = 0;
@@ -1082,12 +1112,14 @@ private:
             t0 = omp_get_wtime();
 
             p_imu->Process(Measures, kf, feats_undistort);
+            const double t_imu_end = omp_get_wtime();
             state_point = kf.get_x();
             pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
 
             if (feats_undistort == nullptr || feats_undistort->empty())
             {
                 RCLCPP_WARN(this->get_logger(), "No point, skip this scan!\n");
+                flperf::on_skip("feats_undistort_empty");
                 return;
             }
 
@@ -1133,6 +1165,7 @@ private:
                     RCLCPP_WARN(this->get_logger(),
                                 "Map init skipped: only %d downsampled points in first usable scan", feats_down_size);
                 }
+                flperf::on_skip("ikdtree_bootstrap");
                 return;
             }
             int featsFromMapNum = ikdtree.validnum();
@@ -1146,6 +1179,7 @@ private:
             if (feats_down_size < 5)
             {
                 RCLCPP_WARN(this->get_logger(), "No point, skip this scan!\n");
+                flperf::on_skip("feats_down_size_lt_5");
                 return;
             }
 
@@ -1210,6 +1244,30 @@ private:
             if (scan_pub_en && scan_body_pub_en) publish_frame_body(pubLaserCloudFull_body_);
             if (effect_pub_en) publish_effect_world(pubLaserCloudEffect_);
             // if (map_pub_en) publish_map(pubLaserCloudMap_);
+            const double t6 = omp_get_wtime();
+
+            /*** perf probe: one row per processed scan (no-op when disabled) ***/
+            if (flperf::enabled())
+            {
+                flperf::ScanRecord rec;
+                rec.t_imu_process = t_imu_end - t0;
+                rec.t_downsample  = t1 - t_imu_end;
+                rec.t_icp         = t_update_end - t_update_start;
+                rec.t_incremental = t5 - t3;
+                rec.t_publish     = t6 - t5;
+                rec.t_total       = t6 - t0;
+                rec.pts_in    = (unsigned long)feats_undistort->points.size();
+                rec.pts_down  = (unsigned long)feats_down_size;
+                rec.eff_feat  = (unsigned long)effct_feat_num;
+                rec.tree_size = (unsigned long)ikdtree.size();
+                rec.pos_x = state_point.pos(0);
+                rec.pos_y = state_point.pos(1);
+                rec.pos_z = state_point.pos(2);
+                rec.vel_norm = state_point.vel.norm();
+                rec.bg_norm  = state_point.bg.norm();
+                rec.ba_norm  = state_point.ba.norm();
+                flperf::on_scan_done(rec);
+            }
 
             /*** Debug variables ***/
             if (runtime_pos_log)
@@ -1301,6 +1359,8 @@ int main(int argc, char** argv)
 
     if (rclcpp::ok())
         rclcpp::shutdown();
+
+    flperf::finish();
     /**************** save map ****************/
     /* 1. make sure you have enough memories
     /* 2. pcd save will largely influence the real-time performences **/

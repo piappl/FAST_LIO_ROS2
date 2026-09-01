@@ -1,0 +1,75 @@
+# perf/config/mid360_perf_baseline.yaml
+#
+# Single Mid-360, publishing overhead stripped down. This is the CONTROL for
+# the whole investigation: identical estimator parameters to config/mid360.yaml,
+# with only the output paths changed.
+#
+# The two changes that matter, and why:
+#
+#   publish.map_en: false
+#     config/mid360.yaml sets this to TRUE. With it on, map_publish_callback()
+#     fires once a second and calls publish_map(), which does
+#         *pcl_wait_pub += *feats_down_body;      <-- appended, NEVER cleared
+#         pcl::toROSMsg(*pcl_wait_pub, msg);      <-- serialise the WHOLE thing
+#         pubLaserCloudMap->publish(msg);         <-- ship it, every second
+#     so the published /Laser_map cloud grows without bound: ~4k points per
+#     second accumulating forever. After 10 minutes that is a ~100 MB message
+#     published every second, on the SAME single thread that has to drain the
+#     IMU queue, through the same DDS transport that has to carry the lidar.
+#     A 60-second bag replay never gets big enough to notice. A live run does.
+#     This is the first thing to rule out.
+#
+#   pcd_save.pcd_save_en: false
+#     save_to_pcd() writes that same ever-growing pcl_wait_pub. Off for tests so
+#     shutdown is fast and memory is attributable to one thing at a time.
+#
+# Estimator parameters below are UNCHANGED from config/mid360.yaml so that any
+# difference in behaviour is attributable to the output settings alone.
+/**:
+    ros__parameters:
+        feature_extract_enable: false
+        point_filter_num: 3
+        max_iteration: 3
+        filter_size_surf: 0.5
+        filter_size_map: 0.5
+        cube_side_length: 1000.0
+        runtime_pos_log_enable: false
+        map_file_path: "./test.pcd"
+
+        common:
+            lid_topic:  "/livox/lidar"
+            imu_topic:  "/livox/imu"
+            time_sync_en: false
+            time_offset_lidar_to_imu: 0.0
+
+        preprocess:
+            lidar_type: 4                # 4 = MID360 handler (PointCloud2 in)
+            scan_line:  4
+            blind: 0.5
+            timestamp_unit: 3            # 3 = ns
+            scan_rate: 10
+
+        mapping:
+            acc_cov: 0.1
+            gyr_cov: 0.1
+            b_acc_cov: 0.0001
+            b_gyr_cov: 0.0001
+            fov_degree:    360.0
+            det_range:     100.0
+            extrinsic_est_en:  true
+            extrinsic_T: [ -0.011, -0.02329, 0.04412 ]
+            extrinsic_R: [ 1., 0., 0.,
+                            0., 1., 0.,
+                            0., 0., 1.]
+
+        publish:
+            path_en: true
+            effect_map_en: false
+            map_en: false                # <-- CHANGED (see header)
+            scan_publish_en:  true
+            dense_publish_en: false
+            scan_bodyframe_pub_en: false # <-- CHANGED: one less full cloud per scan
+
+        pcd_save:
+            pcd_save_en: false           # <-- CHANGED (see header)
+            interval: -1

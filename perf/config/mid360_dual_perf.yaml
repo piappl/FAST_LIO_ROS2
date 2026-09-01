@@ -1,0 +1,88 @@
+# perf/config/mid360_dual_perf.yaml
+#
+# TWO Livox Mid-360 into one FAST-LIO instance.
+#
+# READ THIS FIRST -- FAST-LIO subscribes to exactly ONE lidar topic and ONE IMU
+# topic (see the create_subscription calls in laserMapping.cpp). Two sensors
+# therefore have to be combined upstream, and HOW you combine them decides
+# whether it can work at all:
+#
+#   LiDAR: the two clouds must be merged into one PointCloud2, transformed into
+#          a common frame, with each point's `timestamp` field preserved and the
+#          message header stamp consistent with them. mid360_handler computes
+#              curvature = (point.timestamp - header_stamp) / 1e6   [ms]
+#          and sync_packages() then uses max(curvature) as the scan duration to
+#          derive lidar_end_time. If the two sensors' clocks differ, that max is
+#          the clock offset rather than the scan duration, and the IMU/LiDAR
+#          association silently breaks. Both units must be time-synchronised
+#          (PTP/gPTP from the same master). Verify with:
+#            perf/monitors/stream_monitor.py --cloud-topic <merged topic>
+#          and look at off_span_ms_max: it should be ~100 ms at 10 Hz, not more.
+#
+#   IMU:   do NOT let both IMUs publish to the topic FAST-LIO subscribes to.
+#          imu_cbk() clears the whole imu_buffer whenever a stamp goes backwards,
+#          so two interleaved streams make it clear the buffer constantly.
+#          Pick ONE IMU (whichever is rigidly mounted to the frame you calibrated
+#          extrinsic_T/R against) and point imu_topic at it alone.
+#          Confirm with the monitor's `pubs=` column -- it must read 1.
+#
+# TODO before use:
+#   * set lid_topic / imu_topic to your actual merged-cloud and single-IMU topics
+#   * set extrinsic_T / extrinsic_R for the chosen IMU relative to the merged
+#     cloud frame (the values below are the single-sensor defaults and are
+#     almost certainly wrong for a two-sensor rig)
+/**:
+    ros__parameters:
+        feature_extract_enable: false
+        # Two sensors deliver ~2x the points (~400k pts/s). point_filter_num is
+        # a plain decimation stride in the preprocess handlers, so doubling it
+        # keeps the per-scan estimator load roughly where the single-sensor
+        # tuning had it. Start at 6; lower it only once the run is stable.
+        point_filter_num: 6
+        max_iteration: 3
+        filter_size_surf: 0.5
+        filter_size_map: 0.5
+        cube_side_length: 1000.0
+        runtime_pos_log_enable: false
+        map_file_path: "./test.pcd"
+
+        common:
+            lid_topic:  "/livox/lidar"   # TODO: merged cloud from BOTH units
+            imu_topic:  "/livox/imu"     # TODO: exactly ONE imu, not a merge
+            time_sync_en: false
+            time_offset_lidar_to_imu: 0.0
+
+        preprocess:
+            lidar_type: 4
+            scan_line:  4
+            blind: 0.5
+            timestamp_unit: 3
+            scan_rate: 10
+
+        mapping:
+            acc_cov: 0.1
+            gyr_cov: 0.1
+            b_acc_cov: 0.0001
+            b_gyr_cov: 0.0001
+            fov_degree:    360.0
+            det_range:     100.0
+            # Leave the online extrinsic estimator OFF for a two-sensor rig
+            # during diagnosis: it adds 6 states that can absorb (and hide) a
+            # timestamp problem as an apparent mounting error.
+            extrinsic_est_en:  false
+            extrinsic_T: [ -0.011, -0.02329, 0.04412 ]   # TODO
+            extrinsic_R: [ 1., 0., 0.,
+                            0., 1., 0.,
+                            0., 0., 1.]                   # TODO
+
+        publish:
+            path_en: true
+            effect_map_en: false
+            map_en: false                # see mid360_perf_baseline.yaml header
+            scan_publish_en:  true
+            dense_publish_en: false
+            scan_bodyframe_pub_en: false
+
+        pcd_save:
+            pcd_save_en: false
+            interval: -1

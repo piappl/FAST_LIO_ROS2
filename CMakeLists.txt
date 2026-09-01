@@ -17,7 +17,31 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 message("Current CPU archtecture: ${CMAKE_SYSTEM_PROCESSOR}")
 
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "(x86)|(X86)|(amd64)|(AMD64)")
+# --- perf experiment knob -----------------------------------------------------
+# The ONLY OpenMP parallel region in this codebase is the residual/nearest-
+# neighbour loop in h_share_model() (src/laserMapping.cpp), which is the
+# dominant per-scan cost and runs max_iteration times per scan. The
+# architecture test below enables it for x86 only, so on aarch64 -- a Jetson --
+# MP_EN stays undefined and that loop runs on ONE core.
+#
+# The loop writes only to index-i slots (feats_down_world[i], Nearest_Points[i],
+# point_selected_surf[i] (uint8_t, not vector<bool>), normvec[i], res_last[i]);
+# total_residual is accumulated in a separate sequential loop afterwards. So
+# parallelising it is race-free and deterministic.
+#
+# Default OFF so the stock behaviour is unchanged and the A/B is explicit:
+#   colcon build --cmake-args -DFASTLIO_ENABLE_OPENMP_MP=ON -DFASTLIO_MP_PROC_NUM=4
+# See perf/README.md, experiment E5.
+option(FASTLIO_ENABLE_OPENMP_MP
+       "Enable the OpenMP residual loop regardless of CPU architecture" OFF)
+set(FASTLIO_MP_PROC_NUM "4" CACHE STRING
+    "Threads for the OpenMP residual loop when FASTLIO_ENABLE_OPENMP_MP=ON")
+
+if(FASTLIO_ENABLE_OPENMP_MP)
+  add_definitions(-DMP_EN)
+  add_definitions(-DMP_PROC_NUM=${FASTLIO_MP_PROC_NUM})
+  message(STATUS "perf: OpenMP residual loop FORCED ON with ${FASTLIO_MP_PROC_NUM} threads")
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "(x86)|(X86)|(amd64)|(AMD64)")
   include(ProcessorCount)
   ProcessorCount(N)
   message("Processer number:  ${N}")
@@ -94,6 +118,12 @@ target_include_directories(fastlio_mapping PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>
   ${PCL_INCLUDE_DIRS}
+)
+# Header-only, opt-in performance/crash probe (perf/instrumentation/perf_probe.hpp).
+# It compiles to no-ops unless FASTLIO_PERF_LOG is set at runtime, so it is safe
+# to leave enabled in the build. See perf/README.md.
+target_include_directories(fastlio_mapping PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/perf/instrumentation
 )
 target_link_libraries(fastlio_mapping ${PCL_LIBRARIES} ${PYTHON_LIBRARIES} Eigen3::Eigen)
 target_include_directories(fastlio_mapping PRIVATE ${PYTHON_INCLUDE_DIRS})
