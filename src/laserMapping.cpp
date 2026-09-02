@@ -515,9 +515,36 @@ static bool sync_packages_impl(MeasureGroup &meas)
 
     if (meas.imu.empty())
     {
-        RCLCPP_WARN(rclcpp::get_logger("laser_mapping"),
-                    "Synced package has 0 IMU samples for lidar span [%.6f, %.6f] — propagation will be skipped",
-                    meas.lidar_beg_time, lidar_end_time);
+        // H8. We only get here when every buffered IMU sample is NEWER than this
+        // scan's end -- the guard above already waited for the IMU stream to pass
+        // lidar_end_time, and nothing was consumed. So the scan's IMU window is a
+        // hole that no future sample can fill: waiting is pointless.
+        //
+        // Handing it downstream anyway is worse. ImuProcess::Process() cannot
+        // undistort or propagate without IMU; it bails out and clears
+        // feats_undistort, so timer_callback burns a cycle and logs "No point,
+        // skip this scan!" -- a misleading message for what is really a
+        // lidar/IMU alignment problem. Drop it here instead, where the reason is
+        // known.
+        //
+        // Expected exactly once at startup, when the first cloud lands before the
+        // first IMU sample. Repeatedly, or later in a run, means the two streams
+        // are misaligned -- look at H3 (clocks/topics) and H4 (per-point stamps).
+        const double next_imu = get_time_sec(imu_buffer.front()->header.stamp);
+        static int no_imu_drop_cnt = 0;
+        if (no_imu_drop_cnt++ % 100 == 0)
+        {
+            RCLCPP_WARN(rclcpp::get_logger("laser_mapping"),
+                        "Dropping lidar scan [%.6f, %.6f]: no IMU sample covers it — the oldest "
+                        "queued IMU is %.1f ms past the scan end (%zu queued). Seen %d times.",
+                        meas.lidar_beg_time, lidar_end_time,
+                        (next_imu - lidar_end_time) * 1000.0, imu_buffer.size(),
+                        no_imu_drop_cnt);
+        }
+        flperf::on_scan_dropped_no_imu(meas.lidar_beg_time, lidar_end_time, next_imu,
+                                       (unsigned long)imu_buffer.size());
+        meas.imu.clear();
+        return false;
     }
     static bool first_sync_logged = false;
     if (!first_sync_logged && !meas.imu.empty())

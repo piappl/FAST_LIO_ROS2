@@ -752,11 +752,39 @@ def main(argv):
                 f.set(LIKELY)
                 f.add("  -> implausible velocity: the filter diverged before the crash.")
         if empty:
-            f.set(LIKELY)
-            f.add(f"{int(empty)} scans were synced with an EMPTY IMU batch.")
-            f.add("  -> ImuProcess::Process() returns immediately when meas.imu is "
-                  "empty, so feats_undistort keeps the PREVIOUS scan's points and "
-                  "that stale cloud is matched against the new state.")
+            # sync_packages() DROPS a scan no IMU sample covers, so these never
+            # reach the EKF -- they are lost data, not a corrupted state update.
+            # A drop at startup (first cloud before the first IMU sample) is
+            # normal; a stream of them means lidar and IMU stamps disagree.
+            ev_empty = [r for r in (probe_ev or []) if r.get("kind") == "meas_imu_EMPTY"]
+            processed = [r for r in ev_empty if "action=PROCESSED" in (r.get("detail") or "")]
+            late = [r for r in ev_empty if (fnum(r.get("t_rel_s")) or 0.0) > 5.0]
+            frac = empty / max(len(probe), 1)
+            f.add(f"{int(empty)} lidar scans had no IMU sample covering them "
+                  f"({frac * 100:.2f}% of scans); sync_packages() dropped them.")
+            if processed:
+                f.set(LIKELY)
+                f.add(f"  -> {len(processed)} of those reached the EKF anyway "
+                      f"(event says action=PROCESSED). That is the tripwire in "
+                      f"perf_probe.hpp firing: a scan was registered from a state "
+                      f"never propagated to its timestamp.")
+            elif late and frac > 0.02:
+                f.set(LIKELY)
+                f.add(f"  -> {len(late)} of them are past the 5 s mark, and {frac * 100:.1f}% "
+                      f"of scans is far too many to lose. The lidar and IMU streams are "
+                      f"misaligned in time, not merely offset: see H3 (clocks / topics) "
+                      f"and H4 (per-point stamps).")
+            elif late:
+                f.set(POSSIBLE)
+                f.add(f"  -> {len(late)} of them happened more than 5 s into the run, "
+                      f"so this is not just the startup transient. Check H3 and H4.")
+            else:
+                # A late-starting IMU leaves a lidar backlog that all gets dropped
+                # at once. Bounded by how long the IMU took to come up, and it
+                # cannot recur -- not a divergence signal.
+                f.add("  -> all within the first 5 s: the startup transient, where "
+                      "clouds that arrived before the first IMU sample get drained. "
+                      "Self-limiting; only worth chasing if the IMU is slow to start.")
         if thin:
             f.set(POSSIBLE)
             f.add(f"{int(thin)} scans had fewer than 3 IMU samples")

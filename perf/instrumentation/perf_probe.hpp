@@ -189,6 +189,10 @@ class Probe
       else if (lidar_buf == 0)                 why = "lidar_buffer_empty";
       else if (imu_buf == 0)                   why = "imu_buffer_empty";
       else if (last_imu_stamp < lidar_end)     why = "imu_behind_scan_end";
+      // sync_packages() clears meas.imu when it drops an uncoverable scan; on a
+      // plain stall the previous batch is still in there. See the paired
+      // meas_imu_EMPTY event for the scan that was dropped.
+      else if (meas_imu == 0)                  why = "scan_dropped_no_imu_coverage";
       const double n = static_cast<double>(sync_fail_.load(std::memory_order_relaxed));
       // Do not spam: log the reason at most ~1 Hz.
       const double now = wall_now();
@@ -202,12 +206,13 @@ class Probe
 
     // sync succeeded -- but with how much IMU?
     if (meas_imu == 0) {
-      // ImuProcess::Process() returns immediately on an empty IMU batch, so
-      // feats_undistort keeps the PREVIOUS scan's contents and the frame is
-      // effectively processed twice. Counting this is the whole point.
+      // Should be unreachable: sync_packages() drops a scan no IMU covers rather
+      // than returning it (see on_scan_dropped_no_imu). Kept as a tripwire -- if
+      // this ever fires, an un-propagated scan reached the EKF.
       meas_imu_empty_.fetch_add(1, std::memory_order_relaxed);
       event("meas_imu_EMPTY",
-            "lidar_beg=%.6f lidar_end=%.6f last_imu=%.6f lidar_buf=%lu imu_buf=%lu",
+            "action=PROCESSED lidar_beg=%.6f lidar_end=%.6f last_imu=%.6f "
+            "lidar_buf=%lu imu_buf=%lu",
             lidar_beg, lidar_end, last_imu_stamp, lidar_buf, imu_buf);
     } else if (meas_imu < 3) {
       meas_imu_thin_.fetch_add(1, std::memory_order_relaxed);
@@ -292,6 +297,20 @@ class Probe
     // Flush every scan: at 10-20 Hz the cost is negligible and it means a
     // SIGSEGV cannot swallow the rows that explain it.
     std::fflush(scan_f_);
+  }
+
+  // A lidar scan discarded by sync_packages() because every buffered IMU sample
+  // is newer than the scan's end, so nothing can ever undistort or propagate it.
+  // Unlike the tripwire above, nothing downstream ever sees this scan -- it is
+  // lost data, not a corrupted state update. One at startup is normal.
+  void on_scan_dropped_no_imu(double lidar_beg, double lidar_end,
+                              double next_imu_stamp, unsigned long imu_buf)
+  {
+    if (!enabled_) return;
+    meas_imu_empty_.fetch_add(1, std::memory_order_relaxed);
+    event("meas_imu_EMPTY",
+          "action=dropped lidar_beg=%.6f lidar_end=%.6f next_imu_gap_ms=%.1f imu_buf=%lu",
+          lidar_beg, lidar_end, (next_imu_stamp - lidar_end) * 1e3, imu_buf);
   }
 
   // A scan the timer_callback bailed out of before finishing.
@@ -466,6 +485,11 @@ inline void on_sync(bool ok, unsigned long lidar_buf, unsigned long imu_buf,
                        lidar_end, last_imu);
 }
 inline void on_scan_done(const ScanRecord& r) { Probe::get().on_scan_done(r); }
+inline void on_scan_dropped_no_imu(double lidar_beg, double lidar_end,
+                                   double next_imu_stamp, unsigned long imu_buf)
+{
+  Probe::get().on_scan_dropped_no_imu(lidar_beg, lidar_end, next_imu_stamp, imu_buf);
+}
 inline void on_skip(const char* why) { Probe::get().on_skip(why); }
 inline void finish() { Probe::get().finish(); }
 

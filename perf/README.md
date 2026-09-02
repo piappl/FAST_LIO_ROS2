@@ -337,14 +337,33 @@ which is usually where the answer is.
 
 `analyze.py` labels each of these `LIKELY` / `POSSIBLE` / `not supported`.
 
-**H1 and H9 came back `LIKELY` on run `20260902_055532_phase2` and the code
-fixes for both are now in the tree** — the rows below say what was applied.
-Re-run the same test to measure them: H1 should show far fewer
-`imu_cb_starved` events (593 in that run, worst gap 22.7 ms against a 5 ms
-nominal period), and H6's RSS trend should flatten out (+7.8 MB/min there).
-Note that run used `CYCLONEDDS_URI=file:///usr/config/CycloneDDS.xml`, i.e.
-`perf_env.sh` was never sourced, so the `WhcHigh` half of the H1 fix was not
-in effect — source it for the re-run.
+**H1, H8 and H9 have code fixes in the tree** — the rows below say what was
+applied. Measured on `20260902_075418_phase2`, the re-run after the H1/H9 work:
+
+| | `055532` (before) | `075418` (after) |
+|---|---|---|
+| worst `imu_cbk` gap | 22.7 ms | 10.5 ms |
+| `imu_cb_starved` | 593 | 0 |
+| RSS trend | +7.8 MB/min | +0.4 MB/min |
+| per-scan mean | 11.1 ms | 7.4 ms |
+
+H8 then came up `LIKELY` on that second run, on the strength of a single
+startup event — the first cloud landed before the first IMU sample. Two things
+were wrong with that: `ImuProcess::Process()` had already been fixed to clear
+`cur_pcl_un_` on its empty-IMU return, so the "stale cloud" the finding
+described could not happen; and one bounded startup transient is not
+divergence. `sync_packages()` now drops such a scan outright and `analyze.py`
+grades startup drops apart from sustained ones.
+
+Still open: both runs used `CYCLONEDDS_URI=file:///usr/config/CycloneDDS.xml`,
+i.e. `perf_env.sh` was never sourced, so the `WhcHigh` half of the H1 fix has
+never actually been in effect. Source it for the next run.
+
+Also note `075418`'s Phase-1 checklist FAILs (`pubs=0`, `0.00 Hz` on every
+topic, in both monitors) contradict the probe, which processed 1853 scans off
+those same topics. The monitors saw nothing; LOAM saw everything. That is a
+`stream_monitor` problem, not a sensor problem — do not read those FAILs as
+data loss.
 
 | id | hypothesis | fix if confirmed |
 |---|---|---|
@@ -355,7 +374,7 @@ in effect — source it for the re-run.
 | **H5** | cannot keep up → growing backlog | raise `point_filter_num`, raise `filter_size_surf`/`filter_size_map`, lower `max_iteration`, cap `cube_side_length`; enable OpenMP (E5); bound the deques and drop oldest instead of growing |
 | **H6** | out of memory | `map_en: false`, `pcd_save_en: false`; bound the deques; watch ikd-Tree growth |
 | **H7** | Jetson throttling | `nvpmodel -m 0` + `jetson_clocks`, check cooling; `setup_target.sh --max-perf` |
-| **H8** | state divergence (bad IMU association) | usually a *consequence* of H1/H3/H4 — fix those first |
+| **H8** | state divergence (bad IMU association) | **applied** — `sync_packages()` now DROPS a lidar scan that no buffered IMU sample covers, instead of emitting a package the EKF cannot propagate; the probe records it as `meas_imu_EMPTY action=dropped`. Otherwise still usually a *consequence* of H1/H3/H4 — fix those first |
 | **H9** | an accumulating cloud republished (`publish_map`) | **applied** — `publish_map()` and `save_to_pcd()` now serialise the ikd-Tree instead of the `pcl_wait_pub` accumulator, and `publish_map()` returns early when nothing subscribes; `map_en` also defaults to `false` in `config/hap.yaml` and `config/mid360.yaml` |
 
 ### Experiments worth running as clean A/Bs
