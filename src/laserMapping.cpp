@@ -34,6 +34,7 @@
 // ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 // POSSIBILITY OF SUCH DAMAGE.
 #include <omp.h>
+#include <atomic>
 #include <mutex>
 #include <math.h>
 #include <thread>
@@ -96,7 +97,10 @@ double last_timestamp_lidar = 0, last_timestamp_imu = -1.0;
 double gyr_cov = 0.1, acc_cov = 0.1, b_gyr_cov = 0.0001, b_acc_cov = 0.0001;
 double filter_size_corner_min = 0, filter_size_surf_min = 0, filter_size_map_min = 0, fov_deg = 0;
 double cube_len = 0, HALF_FOV_COS = 0, FOV_DEG = 0, total_distance = 0, lidar_end_time = 0, first_lidar_time = 0.0;
-int    effct_feat_num = 0, time_log_counter = 0, scan_count = 0, publish_count = 0;
+int    effct_feat_num = 0, time_log_counter = 0, scan_count = 0;
+// Incremented in imu_cbk and decremented in the publish_* helpers, which now
+// run on different executor threads (see LaserMappingNode's callback groups).
+std::atomic<int> publish_count{0};
 int    iterCount = 0, feats_down_size = 0, NUM_MAX_ITERATIONS = 0, laserCloudValidNum = 0, pcd_save_interval = -1, pcd_index = 0;
 std::vector<uint8_t> point_selected_surf;
 // Diagnostics: why each downsampled point was rejected in h_share_model.
@@ -291,10 +295,19 @@ void lasermap_fov_segment()
 
 void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg)
 {
+    const double cur_time = get_time_sec(msg->header.stamp);
+    const double preprocess_start_time = omp_get_wtime();
+
+    // Preprocessing is the expensive half of this callback (a per-point copy and
+    // filter over the whole scan). It touches nothing shared, so it runs BEFORE
+    // mtx_buffer is taken: holding the buffer lock across it would block imu_cbk,
+    // which is exactly the starvation H1 is about.
+    PointCloudXYZI::Ptr  ptr(new PointCloudXYZI());
+    p_pre->process(msg, ptr);
+    const double preprocess_s = omp_get_wtime() - preprocess_start_time;
+
     mtx_buffer.lock();
     scan_count ++;
-    double cur_time = get_time_sec(msg->header.stamp);
-    double preprocess_start_time = omp_get_wtime();
     if (!is_first_lidar && cur_time < last_timestamp_lidar)
     {
         RCLCPP_ERROR(rclcpp::get_logger("laser_mapping"),
@@ -311,14 +324,11 @@ void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg)
         is_first_lidar = false;
     }
 
-    PointCloudXYZI::Ptr  ptr(new PointCloudXYZI());
-    p_pre->process(msg, ptr);
     lidar_buffer.push_back(ptr);
     time_buffer.push_back(cur_time);
     last_timestamp_lidar = cur_time;
-    s_plot11[scan_count % MAXN] = omp_get_wtime() - preprocess_start_time;
-    flperf::on_lidar_msg(cur_time, (unsigned long)ptr->points.size(),
-                         omp_get_wtime() - preprocess_start_time);
+    s_plot11[scan_count % MAXN] = preprocess_s;
+    flperf::on_lidar_msg(cur_time, (unsigned long)ptr->points.size(), preprocess_s);
     mtx_buffer.unlock();
     sig_buffer.notify_all();
 }
@@ -327,9 +337,16 @@ double timediff_lidar_wrt_imu = 0.0;
 bool   timediff_set_flg = false;
 void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
 {
+    const double cur_time = get_time_sec(msg->header.stamp);
+    const double preprocess_start_time = omp_get_wtime();
+
+    // See standard_pcl_cbk: preprocess first, take mtx_buffer only for the
+    // bookkeeping, so imu_cbk is never blocked for longer than a few deque ops.
+    PointCloudXYZI::Ptr  ptr(new PointCloudXYZI());
+    p_pre->process(msg, ptr);
+    const double preprocess_s = omp_get_wtime() - preprocess_start_time;
+
     mtx_buffer.lock();
-    double cur_time = get_time_sec(msg->header.stamp);
-    double preprocess_start_time = omp_get_wtime();
     scan_count ++;
     if (!is_first_lidar && cur_time < last_timestamp_lidar)
     {
@@ -360,14 +377,11 @@ void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
         printf("Self sync IMU and LiDAR, time diff is %.10lf \n", timediff_lidar_wrt_imu);
     }
 
-    PointCloudXYZI::Ptr  ptr(new PointCloudXYZI());
-    p_pre->process(msg, ptr);
     lidar_buffer.push_back(ptr);
     time_buffer.push_back(last_timestamp_lidar);
 
-    s_plot11[scan_count % MAXN] = omp_get_wtime() - preprocess_start_time;
-    flperf::on_lidar_msg(last_timestamp_lidar, (unsigned long)ptr->points.size(),
-                         omp_get_wtime() - preprocess_start_time);
+    s_plot11[scan_count % MAXN] = preprocess_s;
+    flperf::on_lidar_msg(last_timestamp_lidar, (unsigned long)ptr->points.size(), preprocess_s);
     mtx_buffer.unlock();
     sig_buffer.notify_all();
 }
@@ -378,17 +392,19 @@ void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in)
     // cout<<"IMU got at: "<<msg_in->header.stamp.toSec()<<endl;
     sensor_msgs::msg::Imu::SharedPtr msg(new sensor_msgs::msg::Imu(*msg_in));
 
-
-    msg->header.stamp = get_ros_time(get_time_sec(msg_in->header.stamp) - time_diff_lidar_to_imu);
-    if (abs(timediff_lidar_wrt_imu) > 0.1 && time_sync_en)
-    {
-        msg->header.stamp = \
-        rclcpp::Time(timediff_lidar_wrt_imu + get_time_sec(msg_in->header.stamp));
-    }
-
-    double timestamp = get_time_sec(msg->header.stamp);
+    const double raw_stamp = get_time_sec(msg_in->header.stamp);
 
     mtx_buffer.lock();
+
+    // timediff_lidar_wrt_imu is written by the lidar callback, which now runs on
+    // its own executor thread -- read it under the same lock that guards the
+    // buffers rather than racing on it.
+    double timestamp = raw_stamp - time_diff_lidar_to_imu;
+    if (abs(timediff_lidar_wrt_imu) > 0.1 && time_sync_en)
+    {
+        timestamp = timediff_lidar_wrt_imu + raw_stamp;
+    }
+    msg->header.stamp = get_ros_time(timestamp);
 
     if (timestamp < last_timestamp_imu)
     {
@@ -522,16 +538,28 @@ static bool sync_packages_impl(MeasureGroup &meas)
 // scan's values; only the buffer depths and the IMU lag are meaningful there.
 bool sync_packages(MeasureGroup &meas)
 {
-    const bool ok = sync_packages_impl(meas);
+    // The deques and last_timestamp_imu are filled by the sensor callbacks, which
+    // run on their own executor threads now (see LaserMappingNode's callback
+    // groups), so every access here has to be under mtx_buffer. Only the deque
+    // manipulation is inside the lock: the caller does the expensive work (IMU
+    // propagation, ICP, ikd-Tree insert) after this returns, lock released.
+    bool ok;
+    unsigned long n_lidar, n_imu, n_time, n_meas_imu;
+    double imu_stamp_latest;
+    {
+        std::lock_guard<std::mutex> lock(mtx_buffer);
+        ok = sync_packages_impl(meas);
+        n_lidar    = (unsigned long)lidar_buffer.size();
+        n_imu      = (unsigned long)imu_buffer.size();
+        n_time     = (unsigned long)time_buffer.size();
+        n_meas_imu = (unsigned long)meas.imu.size();
+        imu_stamp_latest = last_timestamp_imu;
+    }
     if (flperf::enabled())
     {
-        flperf::on_sync(ok,
-                        (unsigned long)lidar_buffer.size(),
-                        (unsigned long)imu_buffer.size(),
-                        (unsigned long)time_buffer.size(),
-                        (unsigned long)meas.imu.size(),
+        flperf::on_sync(ok, n_lidar, n_imu, n_time, n_meas_imu,
                         meas.lidar_beg_time, meas.lidar_end_time,
-                        last_timestamp_imu);
+                        imu_stamp_latest);
     }
     return ok;
 }
@@ -680,38 +708,90 @@ void publish_effect_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::Shar
     pubLaserCloudEffect->publish(laserCloudFullRes3);
 }
 
+// Fills `out` with the current map, straight out of the ikd-Tree. That tree IS
+// the map the filter matches against: already voxel-downsampled to
+// filter_size_map, and kept bounded by lasermap_fov_segment()/cube_side_length.
+// Returns the point count.
+static size_t collect_map_cloud(PointCloudXYZI &out)
+{
+    out.clear();
+    if (ikdtree.Root_Node == nullptr) return 0;
+
+    PointVector().swap(ikdtree.PCL_Storage);   // flatten() appends; start empty
+    ikdtree.flatten(ikdtree.Root_Node, ikdtree.PCL_Storage, NOT_RECORD);
+
+    out.points = std::move(ikdtree.PCL_Storage);
+    PointVector().swap(ikdtree.PCL_Storage);   // give the scratch memory back
+    out.width  = out.points.size();
+    out.height = 1;
+    out.is_dense = true;
+    return out.points.size();
+}
+
+// H9. This used to append the current scan to pcl_wait_pub and republish the
+// WHOLE accumulation once a second, with nothing ever clearing it: unbounded in
+// resident memory (RSS climbed 7.8 MB/min in the 2026-09-02 phase2 run) and,
+// worse, unbounded in the size of the sample handed to a reliable DDS writer --
+// which throttles on WhcHigh and blocks publish() on the calling thread.
+//
+// Publish the ikd-Tree instead. Same intent (here is the map), bounded size,
+// no accumulator. pcl_wait_pub is now just a scratch buffer, refilled from
+// scratch on every call.
 void publish_map(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudMap)
 {
-    PointCloudXYZI::Ptr laserCloudFullRes(dense_pub_en ? feats_undistort : feats_down_body);
-    int size = laserCloudFullRes->points.size();
-    PointCloudXYZI::Ptr laserCloudWorld( \
-                    new PointCloudXYZI(size, 1));
-
-    for (int i = 0; i < size; i++)
+    // Nobody subscribed -> don't pay for the flatten or the serialisation. This
+    // is a whole-map cloud; with no listener it is pure cost on the mapping
+    // thread. RViz attaching later starts it up again on the next tick.
+    if (pubLaserCloudMap->get_subscription_count() == 0)
     {
-        RGBpointBodyToWorld(&laserCloudFullRes->points[i], \
-                            &laserCloudWorld->points[i]);
+        if (!pcl_wait_pub->points.empty()) pcl_wait_pub->clear();
+        return;
     }
-    *pcl_wait_pub += *laserCloudWorld;
+
+    if (collect_map_cloud(*pcl_wait_pub) == 0) return;
 
     sensor_msgs::msg::PointCloud2 laserCloudmsg;
     pcl::toROSMsg(*pcl_wait_pub, laserCloudmsg);
-    // laserCloudmsg.header.stamp = ros::Time().fromSec(lidar_end_time);
     laserCloudmsg.header.stamp = get_ros_time(lidar_end_time);
     laserCloudmsg.header.frame_id = odom_frame;
     pubLaserCloudMap->publish(laserCloudmsg);
-
-    // sensor_msgs::msg::PointCloud2 laserCloudMap;
-    // pcl::toROSMsg(*featsFromMap, laserCloudMap);
-    // laserCloudMap.header.stamp = get_ros_time(lidar_end_time);
-    // laserCloudMap.header.frame_id = odom_frame;
-    // pubLaserCloudMap->publish(laserCloudMap);
 }
 
-void save_to_pcd()
+// Was writing *pcl_wait_pub, which only had anything in it as a side effect of
+// publish_map(). So "save the map" silently wrote an EMPTY file whenever
+// publish.map_en was false -- which is the default, and which several configs
+// combined with pcd_save_en: true -- and wrote the unbounded accumulation when
+// it was true. Build the cloud from the same source publish_map() uses.
+//
+// Returns the number of points written, or -1 on failure.
+long save_to_pcd()
 {
+    if (map_file_path.empty())
+    {
+        RCLCPP_ERROR(rclcpp::get_logger("laser_mapping"),
+                     "Cannot save map: map_file_path is empty (set it in the config)");
+        return -1;
+    }
+
+    PointCloudXYZI cloud;
+    const size_t n = collect_map_cloud(cloud);
+    if (n == 0)
+    {
+        RCLCPP_ERROR(rclcpp::get_logger("laser_mapping"),
+                     "Cannot save map: the ikd-Tree is empty -- no scan has been mapped yet");
+        return -1;
+    }
+
     pcl::PCDWriter pcd_writer;
-    pcd_writer.writeBinary(map_file_path, *pcl_wait_pub);
+    if (pcd_writer.writeBinary(map_file_path, cloud) != 0)
+    {
+        RCLCPP_ERROR(rclcpp::get_logger("laser_mapping"),
+                     "Failed to write map to %s", map_file_path.c_str());
+        return -1;
+    }
+    RCLCPP_INFO(rclcpp::get_logger("laser_mapping"),
+                "Saved %zu map points to %s", n, map_file_path.c_str());
+    return (long)n;
 }
 
 template<typename T>
@@ -1050,18 +1130,45 @@ public:
             cout << "~~~~"<<ROOT_DIR<<" doesn't exist" << endl;
 
         /*** ROS subscribe initialization ***/
+        // One mutually-exclusive callback group per concern, spun by the
+        // MultiThreadedExecutor in main().
+        //
+        // WHY: with rclcpp::spin() every callback shared one thread, so a
+        // timer_callback busy in ICP blocked imu_cbk outright. The probe measured
+        // 593 starvation events and gaps of up to 22.7 ms between imu_cbk calls
+        // against a 5 ms nominal period at 200 Hz -- a deep subscription queue does
+        // not help when nothing is draining it. Splitting the groups lets IMU intake
+        // proceed while a scan is being processed; mtx_buffer guards what they share.
+        //
+        // IMU and lidar are separate groups on purpose: cloud preprocessing must
+        // never be what delays an IMU sample.
+        cbg_imu_ = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+        cbg_lidar_ = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+        // timer_, map_pub_timer_ and the map_save service share ONE group, which
+        // keeps them mutually exclusive: publish_map() and save_to_pcd() read the
+        // ikd-Tree that timer_callback rebuilds in map_incremental().
+        cbg_mapping_ = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+
+        rclcpp::SubscriptionOptions lidar_sub_opts;
+        lidar_sub_opts.callback_group = cbg_lidar_;
+        rclcpp::SubscriptionOptions imu_sub_opts;
+        imu_sub_opts.callback_group = cbg_imu_;
+
         if (p_pre->lidar_type == AVIA)
         {
-            sub_pcl_livox_ = this->create_subscription<livox_ros_driver2::msg::CustomMsg>(lid_topic, 100, livox_pcl_cbk);
+            sub_pcl_livox_ = this->create_subscription<livox_ros_driver2::msg::CustomMsg>(
+                lid_topic, 100, livox_pcl_cbk, lidar_sub_opts);
         }
         else
         {
-            sub_pcl_pc_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(lid_topic, rclcpp::SensorDataQoS().keep_last(100), standard_pcl_cbk);
+            sub_pcl_pc_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
+                lid_topic, rclcpp::SensorDataQoS().keep_last(100), standard_pcl_cbk, lidar_sub_opts);
         }
-        // Deep queue: the executor is single-threaded, so while a scan is being processed
-        // (often >50 ms) incoming IMU msgs sit in the RMW queue. At 200 Hz a depth of 10
-        // holds only 50 ms and silently drops the rest.
-        sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(imu_topic, 1000, imu_cbk);
+        // Deep queue: even with its own thread, imu_cbk can be held off for the few
+        // ms a scan spends in the buffer lock. At 200 Hz a depth of 10 holds only
+        // 50 ms and silently drops the rest.
+        sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(
+            imu_topic, 1000, imu_cbk, imu_sub_opts);
         pubLaserCloudFull_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered", 20);
         pubLaserCloudFull_body_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered_body", 20);
         pubLaserCloudEffect_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_effected", 20);
@@ -1072,12 +1179,12 @@ public:
 
         //------------------------------------------------------------------------------------------------------
         auto period_ms = std::chrono::milliseconds(static_cast<int64_t>(1000.0 / 100.0));
-        timer_ = rclcpp::create_timer(this, this->get_clock(), period_ms, std::bind(&LaserMappingNode::timer_callback, this));
+        timer_ = rclcpp::create_timer(this, this->get_clock(), period_ms, std::bind(&LaserMappingNode::timer_callback, this), cbg_mapping_);
 
         auto map_period_ms = std::chrono::milliseconds(static_cast<int64_t>(1000.0));
-        map_pub_timer_ = rclcpp::create_timer(this, this->get_clock(), map_period_ms, std::bind(&LaserMappingNode::map_publish_callback, this));
+        map_pub_timer_ = rclcpp::create_timer(this, this->get_clock(), map_period_ms, std::bind(&LaserMappingNode::map_publish_callback, this), cbg_mapping_);
 
-        map_save_srv_ = this->create_service<std_srvs::srv::Trigger>("map_save", std::bind(&LaserMappingNode::map_save_callback, this, std::placeholders::_1, std::placeholders::_2));
+        map_save_srv_ = this->create_service<std_srvs::srv::Trigger>("map_save", std::bind(&LaserMappingNode::map_save_callback, this, std::placeholders::_1, std::placeholders::_2), rclcpp::ServicesQoS(), cbg_mapping_);
 
         RCLCPP_INFO(this->get_logger(), "Node init finished.");
     }
@@ -1315,18 +1422,18 @@ private:
 
     void map_save_callback(std_srvs::srv::Trigger::Request::ConstSharedPtr req, std_srvs::srv::Trigger::Response::SharedPtr res)
     {
-        RCLCPP_INFO(this->get_logger(), "Saving map to %s...", map_file_path.c_str());
-        if (pcd_save_en)
-        {
-            save_to_pcd();
-            res->success = true;
-            res->message = "Map saved.";
-        }
-        else
+        if (!pcd_save_en)
         {
             res->success = false;
-            res->message = "Map save disabled.";
+            res->message = "Map save disabled (pcd_save.pcd_save_en is false).";
+            return;
         }
+        RCLCPP_INFO(this->get_logger(), "Saving map to %s...", map_file_path.c_str());
+        const long n = save_to_pcd();
+        res->success = (n >= 0);
+        res->message = res->success
+            ? ("Map saved (" + std::to_string(n) + " points) to " + map_file_path + ".")
+            : "Map save failed, see the node log.";
     }
 
 private:
@@ -1339,6 +1446,10 @@ private:
     rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr sub_imu_;
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_pcl_pc_;
     rclcpp::Subscription<livox_ros_driver2::msg::CustomMsg>::SharedPtr sub_pcl_livox_;
+
+    rclcpp::CallbackGroup::SharedPtr cbg_imu_;
+    rclcpp::CallbackGroup::SharedPtr cbg_lidar_;
+    rclcpp::CallbackGroup::SharedPtr cbg_mapping_;
 
     std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
     rclcpp::TimerBase::SharedPtr timer_;
@@ -1361,23 +1472,27 @@ int main(int argc, char** argv)
 
     signal(SIGINT, SigHandle);
 
-    rclcpp::spin(std::make_shared<LaserMappingNode>());
+    // MultiThreadedExecutor, not rclcpp::spin(): the node puts its IMU
+    // subscription, its lidar subscription and its mapping timers in three
+    // separate mutually-exclusive callback groups precisely so they can run
+    // concurrently. Three threads is the whole point -- more would only add
+    // contention on mtx_buffer, since there is no fourth group to run.
+    auto node = std::make_shared<LaserMappingNode>();
+    rclcpp::executors::MultiThreadedExecutor executor(rclcpp::ExecutorOptions(), 3);
+    executor.add_node(node);
+    executor.spin();
+    executor.remove_node(node);
 
     if (rclcpp::ok())
         rclcpp::shutdown();
 
     flperf::finish();
     /**************** save map ****************/
-    /* 1. make sure you have enough memories
-    /* 2. pcd save will largely influence the real-time performences **/
-    if (pcl_wait_save->size() > 0 && pcd_save_en)
-    {
-        string file_name = string("scans.pcd");
-        string all_points_dir(string(string(ROOT_DIR) + "PCD/") + file_name);
-        pcl::PCDWriter pcd_writer;
-        cout << "current scan saved to /PCD/" << file_name<<endl;
-        pcd_writer.writeBinary(all_points_dir, *pcl_wait_save);
-    }
+    // Was writing pcl_wait_save, which nothing has filled since the accumulator
+    // in publish_frame_world() was commented out -- so pcd_save_en: true saved
+    // nothing at all on shutdown. Go through save_to_pcd(), same as the
+    // /map_save service.
+    if (pcd_save_en) save_to_pcd();
 
     if (runtime_pos_log)
     {

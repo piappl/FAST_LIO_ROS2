@@ -657,8 +657,9 @@ def main(argv):
             if sl is not None and sl > 20:
                 f.set(LIKELY)
                 f.add("  -> sustained growth. Suspects: the unbounded lidar/imu "
-                      "deques (see H5), ikd-Tree map growth, and "
-                      "pcd_save_en/interval=-1 which accumulates every scan.")
+                      "deques (see H5) and ikd-Tree map growth. The old "
+                      "pcl_wait_pub accumulator behind publish_map()/save_to_pcd() "
+                      "is gone -- see H9.")
             elif sl is not None and sl > 5:
                 f.set(POSSIBLE)
             else:
@@ -770,6 +771,15 @@ def main(argv):
     # ---- H9: an accumulating cloud being republished (publish_map) ----
     f = mk("H9", "H9  Is an ever-growing cloud being republished "
                  "(publish_map / pcl_wait_pub)?")
+    # Since the H9 fix, publish_map() serialises the ikd-Tree rather than an
+    # accumulator, so a growing /Laser_map is only a bug if it outgrows the tree.
+    # tree_size is the reference: a cloud that tracks it is the map doing its job,
+    # a cloud several times larger is an accumulator that nothing clears.
+    tree_now = None
+    if probe:
+        tsz = col(probe, "tree_size")
+        if tsz:
+            tree_now = statistics.fmean(tsz[-max(2, len(tsz) // 4):])
     # Direct evidence: a monitored cloud topic whose point count keeps climbing.
     for lab in sorted(monitors):
         agg = monitors[lab]["agg"] or []
@@ -781,11 +791,26 @@ def main(argv):
             if len(pts) < 6:
                 continue
             tr = trend(pts)
-            if tr and tr[0] > 0 and tr[1] > tr[0] * 2.0 and tr[1] - tr[0] > 5000:
+            if not (tr and tr[0] > 0 and tr[1] > tr[0] * 2.0 and tr[1] - tr[0] > 5000):
+                continue
+            grew = (f"{lab}: {topic} point count grew "
+                    f"{tr[0]:.0f} -> {tr[1]:.0f} per message during the run")
+            if tree_now is not None and tr[1] > tree_now * 2.0:
                 f.set(LIKELY)
-                f.add(f"{lab}: {topic} point count grew "
-                      f"{tr[0]:.0f} -> {tr[1]:.0f} per message during the run")
-                f.add("  -> that topic is republishing an accumulating buffer.")
+                f.add(grew)
+                f.add(f"  -> {tr[1]:.0f} points is {tr[1] / max(tree_now, 1.0):.1f}x the "
+                      f"ikd-Tree ({tree_now:.0f} pts): that is an accumulating buffer, "
+                      f"not the map.")
+            elif tree_now is not None:
+                f.set(UNSUPPORTED)
+                f.add(grew)
+                f.add(f"  -> but it tracks the ikd-Tree ({tree_now:.0f} pts), so this is "
+                      f"the map growing as it is explored, not an unbounded buffer.")
+            else:
+                f.set(POSSIBLE)
+                f.add(grew)
+                f.add("  -> no probe data to compare against the ikd-Tree size; "
+                      "rerun with FASTLIO_PERF_LOG set to tell the two apart.")
     # Configuration evidence: the run dir keeps a copy of the config files.
     for fn in sorted(os.listdir(run)):
         if not fn.endswith(".yaml"):
@@ -794,18 +819,12 @@ def main(argv):
             txt = open(os.path.join(run, fn)).read()
         except OSError:
             continue
-        for pat, why in (
-            ("map_en: true",
-             "publish.map_en=true -> map_publish_callback() appends to "
-             "pcl_wait_pub every second and republishes ALL of it; the buffer "
-             "is never cleared"),
-            ("pcd_save_en: true",
-             "pcd_save.pcd_save_en=true -> save_to_pcd() writes that same "
-             "ever-growing pcl_wait_pub"),
-        ):
-            if pat in txt:
-                f.set(POSSIBLE if "pcd" in pat else LIKELY)
-                f.add(f"{fn}: {why}")
+        if "map_en: true" in txt:
+            if f.verdict not in (LIKELY, UNSUPPORTED):
+                f.set(POSSIBLE)
+            f.add(f"{fn}: publish.map_en=true -> map_publish_callback() serialises the "
+                  f"whole ikd-Tree once a second. Bounded, but it is the most "
+                  f"expensive publisher in the node and it blocks the mapping thread")
     if f.verdict == NODATA:
         f.set(UNSUPPORTED)
         f.add("no monitored topic showed cloud growth")

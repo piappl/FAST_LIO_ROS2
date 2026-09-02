@@ -337,9 +337,18 @@ which is usually where the answer is.
 
 `analyze.py` labels each of these `LIKELY` / `POSSIBLE` / `not supported`.
 
+**H1 and H9 came back `LIKELY` on run `20260902_055532_phase2` and the code
+fixes for both are now in the tree** — the rows below say what was applied.
+Re-run the same test to measure them: H1 should show far fewer
+`imu_cb_starved` events (593 in that run, worst gap 22.7 ms against a 5 ms
+nominal period), and H6's RSS trend should flatten out (+7.8 MB/min there).
+Note that run used `CYCLONEDDS_URI=file:///usr/config/CycloneDDS.xml`, i.e.
+`perf_env.sh` was never sourced, so the `WhcHigh` half of the H1 fix was not
+in effect — source it for the re-run.
+
 | id | hypothesis | fix if confirmed |
 |---|---|---|
-| **H1** | loss at the subscriber (shallow QoS + starved single thread) | raise the IMU subscription depth well above 10 (200 Hz × worst stall); give the sensor callbacks their own `CallbackGroup` — **and add `mtx_buffer` locking to `sync_packages()` before introducing threads**. Also raise `WhcHigh` (see below): a throttled reliable writer blocks `publish()` *on that same thread* |
+| **H1** | loss at the subscriber (shallow QoS + starved single thread) | **applied** — IMU depth 1000, one `CallbackGroup` each for IMU / lidar / the mapping timers, `MultiThreadedExecutor` in `main()`, `mtx_buffer` held across `sync_packages()`, and cloud preprocessing moved out of the buffer lock. Still on you: run with `perf/config/cyclonedds_jetson.xml` so `WhcHigh` is 8 MB (see below) — a throttled reliable writer blocks `publish()` *on that same thread* |
 | **H2** | loss in the transport (socket buffers, NIC) | `perf/setup_target.sh` (raises `net.core.rmem_max`) plus `SocketReceiveBufferSize` in `perf/config/cyclonedds_jetson.xml`; jumbo frames on the lidar link if available |
 | **H3** | two sensors on one topic / unsynchronised clocks | one topic per sensor, or merge in a node that reorders by stamp; PTP both lidars off one master; point `imu_topic` at a single IMU |
 | **H4** | per-point timestamps corrupting `lidar_end_time` | fix the driver's timestamp mode; verify `off_span_ms_max` ≈ 100 ms; treat a non-positive `max(curvature)` as a hard error rather than clamping it |
@@ -347,7 +356,7 @@ which is usually where the answer is.
 | **H6** | out of memory | `map_en: false`, `pcd_save_en: false`; bound the deques; watch ikd-Tree growth |
 | **H7** | Jetson throttling | `nvpmodel -m 0` + `jetson_clocks`, check cooling; `setup_target.sh --max-perf` |
 | **H8** | state divergence (bad IMU association) | usually a *consequence* of H1/H3/H4 — fix those first |
-| **H9** | an accumulating cloud republished (`publish_map`) | `map_en: false`; or clear `pcl_wait_pub` after publishing / publish the ikd-Tree instead |
+| **H9** | an accumulating cloud republished (`publish_map`) | **applied** — `publish_map()` and `save_to_pcd()` now serialise the ikd-Tree instead of the `pcl_wait_pub` accumulator, and `publish_map()` returns early when nothing subscribes; `map_en` also defaults to `false` in `config/hap.yaml` and `config/mid360.yaml` |
 
 ### Experiments worth running as clean A/Bs
 
