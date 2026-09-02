@@ -288,6 +288,171 @@ class Finding:
 
 # ---------------------------------------------------------------- the report --
 
+
+def pose_stability(probe):
+    """Report section 4. Its own function so its locals -- `res`, `vel`, `att`
+    and friends -- cannot shadow main()'s.  That is not hypothetical: `res`
+    here is the mean-residual column, and in main() it is the resource-monitor
+    rows."""
+    # --------------------------------------------------------- pose stability --
+    # A stationary platform whose pose wanders is the commonest quality
+    # complaint, and it is a different question from "did the process die".
+    # Stationary spans are found from the RAW IMU (imu_gyr_mean / imu_acc_std),
+    # never from the estimated velocity -- that is the quantity under suspicion.
+    title("4. pose stability")
+    STILL_GYR = 0.02     # rad/s, ~1.1 deg/s
+    STILL_ACC = 0.15     # m/s^2 std about the mean magnitude
+    MIN_SPAN_S = 5.0
+
+    pose_cols = probe and all(k in probe[0] for k in
+                              ("imu_gyr_mean", "roll_deg", "obs_min"))
+    if not pose_cols:
+        print("  no pose-stability columns in perf_probe_scan.csv "
+              "(probe predates them -- rebuild and re-run)")
+    else:
+        still = []
+        run_rows = []
+        for r in probe:
+            g = fnum(r.get("imu_gyr_mean"))
+            a = fnum(r.get("imu_acc_std"))
+            t = fnum(r.get("t_rel_s"))
+            quiet = (g is not None and a is not None and
+                     g < STILL_GYR and a < STILL_ACC and (t or 0) > 3.0)
+            if quiet:
+                run_rows.append(r)
+            else:
+                if run_rows:
+                    still.append(run_rows)
+                run_rows = []
+        if run_rows:
+            still.append(run_rows)
+        still = [sp for sp in still
+                 if (fnum(sp[-1]["t_rel_s"]) - fnum(sp[0]["t_rel_s"])) >= MIN_SPAN_S]
+
+        total_still = sum(fnum(sp[-1]["t_rel_s"]) - fnum(sp[0]["t_rel_s"]) for sp in still)
+        dur = (max(col(probe, "t_rel_s")) if col(probe, "t_rel_s") else 0.0)
+        print(f"  stationary spans (|omega| < {STILL_GYR} rad/s, |a| std < {STILL_ACC} m/s2): "
+              f"{len(still)} spans, {total_still:.0f}s of {dur:.0f}s")
+
+        if not still:
+            print("  the platform was never still for 5s -- nothing to measure here.")
+            print("  For a drift test, leave it stationary for a minute after init.")
+        else:
+            sp = max(still, key=lambda x: fnum(x[-1]["t_rel_s"]) - fnum(x[0]["t_rel_s"]))
+            t0s, t1s = fnum(sp[0]["t_rel_s"]), fnum(sp[-1]["t_rel_s"])
+            span_s = t1s - t0s
+            print(f"  longest span: t_rel {t0s:.0f}..{t1s:.0f}s ({span_s:.0f}s, {len(sp)} scans)")
+            print()
+
+            # The first seconds of a span still carry the post-init convergence
+            # transient, which would be scored as drift. Measure the settled half
+            # too, and judge on that when the span is long enough to have one.
+            settled = sp[len(sp) // 2:] if span_s >= 20.0 and len(sp) >= 20 else None
+
+            worst_mm = 0.0
+            worst_axis = ""
+            hdr = "    axis   peak-to-peak      std      drift rate"
+            if settled:
+                hdr += "     settled p2p"
+            print(hdr)
+            for ax in "xyz":
+                v = col(sp, "pos_" + ax)
+                if not v:
+                    continue
+                pp = (max(v) - min(v)) * 1e3
+                sd = statistics.pstdev(v) * 1e3
+                sl = slope_per_min(sp, "t_rel_s", "pos_" + ax)
+                sl_mm = sl * 1e3 if sl is not None else float("nan")
+                line = f"    {ax}      {pp:8.1f} mm  {sd:7.1f} mm   {sl_mm:+8.1f} mm/min"
+                if settled:
+                    sv = col(settled, "pos_" + ax)
+                    spp = (max(sv) - min(sv)) * 1e3 if sv else float("nan")
+                    line += f"   {spp:8.1f} mm"
+                    judged = spp
+                else:
+                    judged = pp
+                if judged > worst_mm:
+                    worst_mm, worst_axis = judged, ax
+                print(line)
+            if settled:
+                t_settle = fnum(settled[0]["t_rel_s"])
+                print(f"    'settled' = the second half of the span (t_rel > {t_settle:.0f}s), "
+                      f"which excludes post-init convergence. The verdict below uses it.")
+
+            att = []
+            for a in ("roll_deg", "pitch_deg", "yaw_deg"):
+                v = col(sp, a)
+                if v:
+                    att.append((a.replace("_deg", ""), max(v) - min(v)))
+            if att:
+                print("    attitude peak-to-peak: " +
+                      "  ".join(f"{n}={d:.3f} deg" for n, d in att))
+            vel = col(sp, "vel_norm")
+            if vel:
+                print(f"    estimated speed while still: mean={statistics.fmean(vel) * 1e3:.1f} mm/s "
+                      f"max={max(vel) * 1e3:.1f} mm/s  (truth: 0)")
+            print()
+
+            # ---- verdict + the three explanations worth checking -------------
+            if worst_mm < 10.0:
+                print(f"  [ok] worst axis wanders {worst_mm:.1f} mm -- that is solid.")
+            else:
+                lvl = "!!" if worst_mm > 50.0 else " ?"
+                print(f"  [{lvl}] worst axis ({worst_axis}) wanders {worst_mm:.1f} mm "
+                      f"peak-to-peak while stationary"
+                      + (" (settled window)." if settled else "."))
+
+                # 1. geometry: is the pose observable at all in that direction?
+                omin = col(sp, "obs_min")
+                if omin:
+                    om = statistics.fmean(omin)
+                    wk = [statistics.fmean(col(sp, "obs_weak_" + a) or [0.0]) for a in "xyz"]
+                    print(f"       observability: min eigenvalue {om:.3f} of 0.333 "
+                          f"(weak direction [{wk[0]:+.2f} {wk[1]:+.2f} {wk[2]:+.2f}])")
+                    if om < 0.05:
+                        print("       -> the plane normals barely span that direction: the "
+                              "scene does not constrain it (corridor, one flat wall, open "
+                              "space). No filter tuning fixes geometry -- add structure or "
+                              "accept the drift along it.")
+
+                # 2. attitude: a tilt error becomes a position ramp
+                pr = [d for n, d in att if n in ("roll", "pitch")]
+                gx = col(sp, "grav_x")
+                gy = col(sp, "grav_y")
+                if gx and gy:
+                    g_horiz = math.hypot(statistics.fmean(gx), statistics.fmean(gy))
+                    tilt_deg = math.degrees(math.asin(min(1.0, g_horiz / 9.81)))
+                    print(f"       gravity leaks {g_horiz:.3f} m/s2 sideways "
+                          f"(= {tilt_deg:.2f} deg of tilt error)")
+                    if g_horiz > 0.05:
+                        print("       -> that residual accelerates the state; integrated "
+                              "twice it IS the position wander. Re-do IMU init with the "
+                              "platform genuinely still (see the acc_std warning at init).")
+                if pr and max(pr) > 0.5:
+                    print(f"       -> roll/pitch itself swings {max(pr):.2f} deg while "
+                          f"stationary; the attitude is not settling, so position cannot.")
+
+                # 3. bias still converging
+                for nm in ("ba", "bg"):
+                    d = []
+                    for a in "xyz":
+                        v = col(sp, f"{nm}_{a}")
+                        if v:
+                            d.append(abs(v[-1] - v[0]))
+                    if d and max(d) > 1e-3:
+                        u = "m/s2" if nm == "ba" else "rad/s"
+                        print(f"       {nm} still moving {max(d):.4f} {u} over the span "
+                              f"-> bias not converged; give it longer before judging drift.")
+
+                res_v = col(sp, "res_mean")
+                eff_v = col(sp, "eff_feat")
+                if res_v and eff_v:
+                    print(f"       fit: mean residual {statistics.fmean(res_v) * 100:.2f} cm "
+                          f"over {statistics.fmean(eff_v):.0f} effective points")
+                print("       See 'Pose stability' in perf/README.md for what each of "
+                      "these means and what to do about it.")
+
+
 def main(argv):
     if len(argv) != 1:
         print(__doc__)
@@ -866,163 +1031,8 @@ def main(argv):
     for fnd in findings:
         fnd.render()
 
-    # --------------------------------------------------------- pose stability --
-    # A stationary platform whose pose wanders is the commonest quality
-    # complaint, and it is a different question from "did the process die".
-    # Stationary spans are found from the RAW IMU (imu_gyr_mean / imu_acc_std),
-    # never from the estimated velocity -- that is the quantity under suspicion.
-    title("4. pose stability")
-    STILL_GYR = 0.02     # rad/s, ~1.1 deg/s
-    STILL_ACC = 0.15     # m/s^2 std about the mean magnitude
-    MIN_SPAN_S = 5.0
-
-    pose_cols = probe and all(k in probe[0] for k in
-                              ("imu_gyr_mean", "roll_deg", "obs_min"))
-    if not pose_cols:
-        print("  no pose-stability columns in perf_probe_scan.csv "
-              "(probe predates them -- rebuild and re-run)")
-    else:
-        still = []
-        run_rows = []
-        for r in probe:
-            g = fnum(r.get("imu_gyr_mean"))
-            a = fnum(r.get("imu_acc_std"))
-            t = fnum(r.get("t_rel_s"))
-            quiet = (g is not None and a is not None and
-                     g < STILL_GYR and a < STILL_ACC and (t or 0) > 3.0)
-            if quiet:
-                run_rows.append(r)
-            else:
-                if run_rows:
-                    still.append(run_rows)
-                run_rows = []
-        if run_rows:
-            still.append(run_rows)
-        still = [sp for sp in still
-                 if (fnum(sp[-1]["t_rel_s"]) - fnum(sp[0]["t_rel_s"])) >= MIN_SPAN_S]
-
-        total_still = sum(fnum(sp[-1]["t_rel_s"]) - fnum(sp[0]["t_rel_s"]) for sp in still)
-        dur = (max(col(probe, "t_rel_s")) if col(probe, "t_rel_s") else 0.0)
-        print(f"  stationary spans (|omega| < {STILL_GYR} rad/s, |a| std < {STILL_ACC} m/s2): "
-              f"{len(still)} spans, {total_still:.0f}s of {dur:.0f}s")
-
-        if not still:
-            print("  the platform was never still for 5s -- nothing to measure here.")
-            print("  For a drift test, leave it stationary for a minute after init.")
-        else:
-            sp = max(still, key=lambda x: fnum(x[-1]["t_rel_s"]) - fnum(x[0]["t_rel_s"]))
-            t0s, t1s = fnum(sp[0]["t_rel_s"]), fnum(sp[-1]["t_rel_s"])
-            span_s = t1s - t0s
-            print(f"  longest span: t_rel {t0s:.0f}..{t1s:.0f}s ({span_s:.0f}s, {len(sp)} scans)")
-            print()
-
-            # The first seconds of a span still carry the post-init convergence
-            # transient, which would be scored as drift. Measure the settled half
-            # too, and judge on that when the span is long enough to have one.
-            settled = sp[len(sp) // 2:] if span_s >= 20.0 and len(sp) >= 20 else None
-
-            worst_mm = 0.0
-            worst_axis = ""
-            hdr = "    axis   peak-to-peak      std      drift rate"
-            if settled:
-                hdr += "     settled p2p"
-            print(hdr)
-            for ax in "xyz":
-                v = col(sp, "pos_" + ax)
-                if not v:
-                    continue
-                pp = (max(v) - min(v)) * 1e3
-                sd = statistics.pstdev(v) * 1e3
-                sl = slope_per_min(sp, "t_rel_s", "pos_" + ax)
-                sl_mm = sl * 1e3 if sl is not None else float("nan")
-                line = f"    {ax}      {pp:8.1f} mm  {sd:7.1f} mm   {sl_mm:+8.1f} mm/min"
-                if settled:
-                    sv = col(settled, "pos_" + ax)
-                    spp = (max(sv) - min(sv)) * 1e3 if sv else float("nan")
-                    line += f"   {spp:8.1f} mm"
-                    judged = spp
-                else:
-                    judged = pp
-                if judged > worst_mm:
-                    worst_mm, worst_axis = judged, ax
-                print(line)
-            if settled:
-                t_settle = fnum(settled[0]["t_rel_s"])
-                print(f"    'settled' = the second half of the span (t_rel > {t_settle:.0f}s), "
-                      f"which excludes post-init convergence. The verdict below uses it.")
-
-            att = []
-            for a in ("roll_deg", "pitch_deg", "yaw_deg"):
-                v = col(sp, a)
-                if v:
-                    att.append((a.replace("_deg", ""), max(v) - min(v)))
-            if att:
-                print("    attitude peak-to-peak: " +
-                      "  ".join(f"{n}={d:.3f} deg" for n, d in att))
-            vel = col(sp, "vel_norm")
-            if vel:
-                print(f"    estimated speed while still: mean={statistics.fmean(vel) * 1e3:.1f} mm/s "
-                      f"max={max(vel) * 1e3:.1f} mm/s  (truth: 0)")
-            print()
-
-            # ---- verdict + the three explanations worth checking -------------
-            if worst_mm < 10.0:
-                print(f"  [ok] worst axis wanders {worst_mm:.1f} mm -- that is solid.")
-            else:
-                lvl = "!!" if worst_mm > 50.0 else " ?"
-                print(f"  [{lvl}] worst axis ({worst_axis}) wanders {worst_mm:.1f} mm "
-                      f"peak-to-peak while stationary"
-                      + (" (settled window)." if settled else "."))
-
-                # 1. geometry: is the pose observable at all in that direction?
-                omin = col(sp, "obs_min")
-                if omin:
-                    om = statistics.fmean(omin)
-                    wk = [statistics.fmean(col(sp, "obs_weak_" + a) or [0.0]) for a in "xyz"]
-                    print(f"       observability: min eigenvalue {om:.3f} of 0.333 "
-                          f"(weak direction [{wk[0]:+.2f} {wk[1]:+.2f} {wk[2]:+.2f}])")
-                    if om < 0.05:
-                        print("       -> the plane normals barely span that direction: the "
-                              "scene does not constrain it (corridor, one flat wall, open "
-                              "space). No filter tuning fixes geometry -- add structure or "
-                              "accept the drift along it.")
-
-                # 2. attitude: a tilt error becomes a position ramp
-                pr = [d for n, d in att if n in ("roll", "pitch")]
-                gx = col(sp, "grav_x")
-                gy = col(sp, "grav_y")
-                if gx and gy:
-                    g_horiz = math.hypot(statistics.fmean(gx), statistics.fmean(gy))
-                    tilt_deg = math.degrees(math.asin(min(1.0, g_horiz / 9.81)))
-                    print(f"       gravity leaks {g_horiz:.3f} m/s2 sideways "
-                          f"(= {tilt_deg:.2f} deg of tilt error)")
-                    if g_horiz > 0.05:
-                        print("       -> that residual accelerates the state; integrated "
-                              "twice it IS the position wander. Re-do IMU init with the "
-                              "platform genuinely still (see the acc_std warning at init).")
-                if pr and max(pr) > 0.5:
-                    print(f"       -> roll/pitch itself swings {max(pr):.2f} deg while "
-                          f"stationary; the attitude is not settling, so position cannot.")
-
-                # 3. bias still converging
-                for nm in ("ba", "bg"):
-                    d = []
-                    for a in "xyz":
-                        v = col(sp, f"{nm}_{a}")
-                        if v:
-                            d.append(abs(v[-1] - v[0]))
-                    if d and max(d) > 1e-3:
-                        u = "m/s2" if nm == "ba" else "rad/s"
-                        print(f"       {nm} still moving {max(d):.4f} {u} over the span "
-                              f"-> bias not converged; give it longer before judging drift.")
-
-                res = col(sp, "res_mean")
-                eff = col(sp, "eff_feat")
-                if res and eff:
-                    print(f"       fit: mean residual {statistics.fmean(res) * 100:.2f} cm "
-                          f"over {statistics.fmean(eff):.0f} effective points")
-                print("       See 'Pose stability' in perf/README.md for what each of "
-                      "these means and what to do about it.")
+    # ------------------------------------------------- pose stability (sec 4) --
+    pose_stability(probe)
 
     # ------------------------------------------------------ final 30 seconds --
     title("5. the last 30 s before the end")
@@ -1042,16 +1052,19 @@ def main(argv):
             print(f"    {'t_rel':>7} {'lidBuf':>6} {'imuBuf':>6} {'measImu':>7} "
                   f"{'total_ms':>8} {'icp_ms':>7} {'age_ms':>7} {'rss_MB':>7} "
                   f"{'vel':>6}")
+            # .get, not [] -- this table is the thing you read after a crash, and
+            # the CSV may well be truncated mid-row. Losing the report to a
+            # KeyError here would defeat the point of the probe.
             for r in rows[::5][-14:]:
-                print(f"    {fnum(r['t_rel_s'], 0):>7.1f} "
-                      f"{fnum(r['lidar_buf'], 0):>6.0f} "
-                      f"{fnum(r['imu_buf'], 0):>6.0f} "
-                      f"{fnum(r['meas_imu'], 0):>7.0f} "
-                      f"{fnum(r['t_total_ms'], 0):>8.1f} "
-                      f"{fnum(r['t_icp_ms'], 0):>7.1f} "
-                      f"{fnum(r['pipeline_age_ms'], 0):>7.0f} "
-                      f"{fnum(r['rss_mb'], 0):>7.1f} "
-                      f"{fnum(r['vel_norm'], 0):>6.2f}")
+                print(f"    {fnum(r.get('t_rel_s'), 0):>7.1f} "
+                      f"{fnum(r.get('lidar_buf'), 0):>6.0f} "
+                      f"{fnum(r.get('imu_buf'), 0):>6.0f} "
+                      f"{fnum(r.get('meas_imu'), 0):>7.0f} "
+                      f"{fnum(r.get('t_total_ms'), 0):>8.1f} "
+                      f"{fnum(r.get('t_icp_ms'), 0):>7.1f} "
+                      f"{fnum(r.get('pipeline_age_ms'), 0):>7.0f} "
+                      f"{fnum(r.get('rss_mb'), 0):>7.1f} "
+                      f"{fnum(r.get('vel_norm'), 0):>6.2f}")
         evs = [r for r in probe_ev if (fnum(r.get("t_rel_s")) or 0) >= lo]
         if evs:
             print(f"\n  probe events in the final window ({len(evs)}):")
@@ -1064,7 +1077,7 @@ def main(argv):
             print(f"    {'t_rel':>7} {'alive':>5} {'rss_MB':>7} {'cpu%':>6} "
                   f"{'topThr%':>7} {'availMB':>8} {'freqMHz':>8} {'rcvbufErr':>9}")
             for r in rrows[::max(1, len(rrows)//10)][-12:]:
-                print(f"    {fnum(r['t_rel_s'], 0):>7.1f} "
+                print(f"    {fnum(r.get('t_rel_s'), 0):>7.1f} "
                       f"{fnum(r.get('proc_alive'), 0):>5.0f} "
                       f"{fnum(r.get('rss_mb'), 0):>7.1f} "
                       f"{fnum(r.get('cpu_pct'), 0):>6.1f} "
