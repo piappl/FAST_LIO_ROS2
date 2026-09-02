@@ -384,8 +384,9 @@ data loss.
 | **E1** | no accumulating map | `--loam-cmd "... config_path:=$PWD/perf/config config_file:=mid360_perf_baseline.yaml"` |
 | **E2** | DDS config, three ways | merged (default): plain `source perf/config/perf_env.sh`; stock: `LOAM_PERF_DDS_URI=`; pre-merge baseline: write the snippet below to `perf/config/CycloneDDS.xml` and set `LOAM_PERF_DDS_URI=file://$PWD/perf/config/CycloneDDS.xml` |
 | **E3** | no RViz (it subscribes to every cloud) | `rviz:=false` |
-| **E4** | decimate harder | `point_filter_num: 6` (or 8) |
+| **E4** | decimate harder | `point_filter_num: 6` (or 8) — **no effect for `lidar_type: 4`**: the decimation line in `Preprocess::mid360_handler()` is commented out (`src/preprocess.cpp:514`), so for a Mid-360/HAP the only thinning knob is `filter_size_surf` |
 | **E5** | OpenMP residual loop on | `colcon build --packages-select fast_lio --cmake-args -DCMAKE_BUILD_TYPE=RelWithDebInfo -DFASTLIO_ENABLE_OPENMP_MP=ON -DFASTLIO_MP_PROC_NUM=4` |
+| **E6** | denser constraints, for pose stability | `--loam-cmd "... config_path:=$PWD/perf/config config_file:=mid360_dense.yaml"` — `filter_size_surf`/`filter_size_map` 0.5 → 0.25. Compare section 4 against a baseline run of equal length |
 
 Change **one** thing per run and keep the run directories — they are all
 self-describing (`run_info.txt` records the config, env, and git revision).
@@ -425,6 +426,26 @@ explanations are checked, in the order worth believing:
 `res_mean` and `eff_feat` come last as a fit-quality sanity check: a residual
 that is a large fraction of `filter_size_map` means the scan is not really
 locking onto the map.
+
+### A reference measurement
+
+Run `20260902_105419_phase2` (600 s, Mid-360, mostly stationary, `mid360.yaml`),
+after the H1/H8/H9 and correspondence-reset fixes:
+
+```
+  longest span: t_rel 373..427s (54s, 541 scans)
+    axis   peak-to-peak      std      drift rate     settled p2p
+    x          14.1 mm      2.3 mm       +0.6 mm/min       10.7 mm
+    y          13.5 mm      2.2 mm       -0.9 mm/min       10.5 mm
+    z           7.5 mm      1.3 mm       -1.8 mm/min        6.0 mm
+    attitude peak-to-peak: roll=0.229 pitch=0.190 yaw=0.223 deg
+    fit: mean residual 2.17 cm over 393 effective points
+```
+
+Drift rates under 2 mm/min, so it is bounded wander rather than a ramp. The
+number that stands out is **393 effective points** against an ikd-Tree of 1902 —
+a very thin problem — while the same run used 7.9 ms of its 100 ms per-scan
+budget. That is what experiment E6 (`perf/config/mid360_dense.yaml`) tests.
 
 ### The columns behind it
 

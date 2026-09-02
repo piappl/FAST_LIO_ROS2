@@ -1,0 +1,111 @@
+# perf/config/mid360_dense.yaml
+#
+# Experiment E6: does the pose sit stiller if you give the EKF more points?
+#
+# WHY THIS EXISTS. In run 20260902_105419_phase2 (600 s, mostly stationary) the
+# estimator was clean on every stability hypothesis but section 4 reported:
+#
+#     worst axis (x) wanders 10.7 mm peak-to-peak while stationary
+#     fit: mean residual 2.17 cm over 393 effective points
+#
+# 393 point-to-plane constraints, against an ikd-Tree holding 1902 points for
+# the whole scene. That is a very thin problem to solve a 6-DoF pose from, and
+# thin problems are noisy ones. Meanwhile the same run used 7.9 ms of its 100 ms
+# per-scan budget (mean), peaked at 16.1 ms, and never pushed a thread above 10%
+# CPU. There is roughly an order of magnitude of headroom going unused.
+#
+# WHERE THE POINTS GO. A Mid-360 scan arrives with ~15.5k points and reaches the
+# EKF as ~850. Note that `point_filter_num` is NOT what does that:
+# Preprocess::mid360_handler() has its `if (i % point_filter_num != 0) continue;`
+# COMMENTED OUT (src/preprocess.cpp:514), so for lidar_type: 4 that parameter is
+# dead and changing it does nothing. The entire 18x reduction is the
+# `filter_size_surf` VoxelGrid. That is the only knob that matters here.
+#
+# THE CHANGES, all three of them:
+#
+#   filter_size_surf: 0.5 -> 0.25
+#     The scan-side voxel grid. Surfaces are 2D, so halving the leaf size gives
+#     roughly 4x the points: ~850 -> ~3400 downsampled, and proportionally more
+#     accepted correspondences.
+#
+#   filter_size_map: 0.5 -> 0.25
+#     The map-side resolution, which sets how finely the ikd-Tree stores the
+#     world. Leaving this at 0.5 would waste the denser scan: the plane fits in
+#     h_share_model() come from the map's 5 nearest neighbours, and a 0.5 m map
+#     gives a coarse plane no matter how dense the scan is. That coarseness is
+#     what the 2.17 cm mean residual is measuring.
+#
+#   max_iteration: 3 -> 4
+#     Cheap now that the correspondence-reset bug is fixed (iterations 2+ used
+#     to re-solve against iteration 1's points, so extra iterations bought
+#     nothing). One more is worth trying; drop it back to 3 if t_icp_ms hurts.
+#
+# COST. Expect t_icp_ms and tree_size to grow roughly with the point count, so
+# per-scan mean somewhere in the 15-30 ms range and RSS up by tens of MB. Both
+# have ample room. If per-scan p95 approaches 100 ms, or lidar_buf starts
+# sitting above 0, back filter_size_surf off to 0.3 -- H5 and the buffer depths
+# in the report will tell you immediately.
+#
+# WHAT TO COMPARE, in section 4 of two runs of equal length and equal stillness:
+#     settled p2p per axis      <- want smaller
+#     mean residual             <- want smaller; it is a fraction of the map res
+#     effective points          <- want larger
+#     attitude peak-to-peak     <- want smaller
+#     obs min eigenvalue        <- geometry; should barely move, it is the scene
+# and in section 1 / H5: per-scan mean and p95, and lidar_buf max.
+#
+# Run it:
+#   ./perf/run_test.sh --name dense --duration 600 \
+#     --loam-cmd "ros2 launch fast_lio mapping.launch.py rviz:=false \
+#                 config_path:=$PWD/perf/config config_file:=mid360_dense.yaml"
+#
+# Everything else is identical to config/mid360.yaml, so any difference is
+# attributable to the three lines above.
+/**:
+    ros__parameters:
+        feature_extract_enable: false
+        point_filter_num: 3          # inert for lidar_type 4 -- see the header
+        max_iteration: 4             # <-- CHANGED (was 3)
+        filter_size_surf: 0.25       # <-- CHANGED (was 0.5) -- the main lever
+        filter_size_map: 0.25        # <-- CHANGED (was 0.5)
+        cube_side_length: 1000.0
+        runtime_pos_log_enable: false
+        map_file_path: "./test.pcd"
+
+        common:
+            lid_topic:  "/livox/lidar"
+            imu_topic:  "/livox/imu"
+            time_sync_en: false
+            time_offset_lidar_to_imu: 0.0
+
+        preprocess:
+            lidar_type: 4
+            scan_line:  4
+            blind: 0.5
+            timestamp_unit: 3
+            scan_rate: 10
+
+        mapping:
+            acc_cov: 0.1
+            gyr_cov: 0.1
+            b_acc_cov: 0.0001
+            b_gyr_cov: 0.0001
+            fov_degree:    360.0
+            det_range:     100.0
+            extrinsic_est_en:  true
+            extrinsic_T: [ -0.011, -0.02329, 0.04412 ]
+            extrinsic_R: [ 1., 0., 0.,
+                            0., 1., 0.,
+                            0., 0., 1.]
+
+        publish:
+            path_en: true
+            effect_map_en: false
+            map_en: false                # keep the expensive publisher out of it
+            scan_publish_en:  true
+            dense_publish_en: false
+            scan_bodyframe_pub_en: true
+
+        pcd_save:
+            pcd_save_en: false
+            interval: -1
