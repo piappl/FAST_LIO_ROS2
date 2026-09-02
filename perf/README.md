@@ -392,6 +392,75 @@ self-describing (`run_info.txt` records the config, env, and git revision).
 
 ---
 
+## Pose stability
+
+A different question from the rest of this document: not "did the process die"
+but "does the pose sit still when the sensor does". Section 4 of the report
+answers it, and needs no special run mode — stationary spans are found from the
+**raw IMU** (`imu_gyr_mean < 0.02 rad/s`, `imu_acc_std < 0.15 m/s2`), never from
+the estimated velocity, which is the quantity under suspicion.
+
+To measure drift deliberately: start the node, leave the platform completely
+still for at least a minute, and run the analyzer. Keep it still for the *first*
+few seconds too — IMU init estimates gravity and the gyro bias from the first 20
+samples, and a platform that is moving then poisons the whole run (the node warns
+about this at init).
+
+### Reading section 4
+
+The verdict uses the **settled** column — the second half of the stationary span
+— because the first seconds still hold the post-init convergence ramp and would
+otherwise be scored as drift. That distinction matters: in one 60 s test the raw
+peak-to-peak was 228 mm and the settled figure 5.6 mm. Same data.
+
+Under 10 mm peak-to-peak is solid; over 50 mm is flagged. Then three
+explanations are checked, in the order worth believing:
+
+| what it prints | what it means | what to do |
+|---|---|---|
+| `observability: min eigenvalue X of 0.333` | eigenvalues of the mean plane-normal scatter matrix over the correspondences the EKF used. 0.333 each = every direction constrained. Small = the scene does not pin down `obs_weak_*` | geometry, not tuning. A corridor, one flat wall or an open field cannot constrain the axis. Add structure, or accept drift along it |
+| `gravity leaks N m/s2 sideways` | estimated gravity has a horizontal component, i.e. an attitude error. That residual is integrated twice into position — this is the classic cause of a stationary pose sliding | re-init with the platform genuinely still; check the `acc_std` warning printed at IMU init |
+| `ba/bg still moving` | the bias states have not converged over the span | let it settle longer before judging drift |
+
+`res_mean` and `eff_feat` come last as a fit-quality sanity check: a residual
+that is a large fraction of `filter_size_map` means the scan is not really
+locking onto the map.
+
+### The columns behind it
+
+Appended to `perf_probe_scan.csv` (existing column positions are unchanged):
+
+`roll_deg pitch_deg yaw_deg` · `grav_x/y/z` · `bg_x/y/z ba_x/y/z` · `res_mean` ·
+`imu_gyr_mean imu_acc_std` · `obs_min obs_mid obs_max obs_weak_x/y/z`
+
+All of it is computed inside the probe's `if (flperf::enabled())` block, so it
+costs nothing when `FASTLIO_PERF_LOG` is unset.
+
+### The correspondence-reset bug
+
+Found while adding the above, and worth knowing if you are comparing against an
+older build. `laserCloudOri` and `corr_normvect` are filled with `push_back` in
+`h_share_model()`, which runs once per **EKF iteration**, but they were cleared
+once per **scan** in `timer_callback`. With `max_iteration: 3` (and 10 in
+`hap.yaml`), iterations 2+ appended behind iteration 1's data while the Jacobian
+loop indexes `points[0 .. effct_feat_num)` — so every iteration after the first
+solved against the *first* iteration's points and normals. They are now cleared
+per iteration. Measured on a 60 s synthetic stationary run:
+
+| | before | after |
+|---|---|---|
+| attitude peak-to-peak | 6.54 deg | 0.29 deg |
+| estimated speed while still | 28.9 mm/s mean, 283 mm/s max | 8.6 mm/s mean, 67 mm/s max |
+| mean residual | 2.66 cm | 1.22 cm |
+| effective points per scan | 614 | 1955 |
+| settled worst-axis p2p | 25.4 mm | 13.7 mm |
+
+Attitude, residual and match count are unambiguous. Position peak-to-peak varied
+between single runs — measure it on your own hardware before drawing a
+conclusion about the centimetres.
+
+---
+
 ## Your Cyclone DDS config vs the merged one
 
 `perf/config/cyclonedds_jetson.xml` is the merge of the pre-existing config with

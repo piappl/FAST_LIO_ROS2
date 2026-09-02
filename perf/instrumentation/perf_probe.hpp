@@ -89,6 +89,43 @@ struct ScanRecord
   // mapping.extrinsic_est_en:true these converge to the sensor's true internal
   // offset, so a run started from zeros MEASURES the extrinsic for you.
   double ext_t_x = 0.0, ext_t_y = 0.0, ext_t_z = 0.0;
+
+  // ---- pose stability -----------------------------------------------------
+  // Filled only when the probe is enabled: the caller computes all of it inside
+  // its own `if (flperf::enabled())` block, so this costs nothing when off.
+
+  // Attitude, degrees. A stationary sensor whose POSITION wanders usually has an
+  // ATTITUDE problem underneath: a fraction of a degree of roll/pitch error
+  // leaves a residual gravity component that the EKF integrates into velocity,
+  // and from there into position.
+  double roll_deg = 0.0, pitch_deg = 0.0, yaw_deg = 0.0;
+
+  // Estimated gravity in the world frame. Should sit at (0, 0, -9.81); a
+  // persistent horizontal component is the tilt error described above.
+  double grav_x = 0.0, grav_y = 0.0, grav_z = 0.0;
+
+  // Full bias vectors, not just the norms: drift confined to one axis is
+  // usually a bias on one axis.
+  double bg_x = 0.0, bg_y = 0.0, bg_z = 0.0;
+  double ba_x = 0.0, ba_y = 0.0, ba_z = 0.0;
+
+  // Mean point-to-plane residual over the accepted correspondences.
+  double res_mean = 0.0;
+
+  // Raw IMU motion, straight off the wire and independent of the filter. This is
+  // what says "the platform was actually still" -- the estimated velocity cannot
+  // be trusted to say it, since that is the thing under suspicion.
+  double imu_gyr_mean = 0.0;   // mean |omega| over this scan's IMU batch, rad/s
+  double imu_acc_std = 0.0;    // std of |a| over the same batch, m/s^2
+
+  // Translation observability: eigenvalues (ascending) of the mean plane-normal
+  // scatter matrix over the correspondences the EKF actually used. Three roughly
+  // equal values near 0.33 means every direction is constrained. A small obs_min
+  // means the geometry does not pin the pose down along obs_weak_*, and the
+  // estimate is free to slide there -- a corridor, a single flat wall, an
+  // empty room.
+  double obs_min = 0.0, obs_mid = 0.0, obs_max = 0.0;
+  double obs_weak_x = 0.0, obs_weak_y = 0.0, obs_weak_z = 0.0;
 };
 
 // -------------------------------------------------------------------- probe --
@@ -269,7 +306,12 @@ class Probe
         "%.5f,%.5f,%.5f,"                    // online extrinsic translation
         "%lu,%lu,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,"  // stream deltas
         "%.2f,"                              // rss_mb
-        "%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu\n", // cumulative anomaly counters
+        "%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,"    // cumulative anomaly counters
+        "%.4f,%.4f,%.4f,"                    // attitude deg
+        "%.5f,%.5f,%.5f,"                    // gravity
+        "%.7f,%.7f,%.7f,%.7f,%.7f,%.7f,"     // bg, ba
+        "%.6f,%.6f,%.5f,"                    // res_mean, imu_gyr_mean, imu_acc_std
+        "%.5f,%.5f,%.5f,%.4f,%.4f,%.4f\n",   // observability
         now, now - t0_, scans_.load(std::memory_order_relaxed),
         lidar_buf_last_.load(std::memory_order_relaxed),
         imu_buf_last_.load(std::memory_order_relaxed),
@@ -293,7 +335,13 @@ class Probe
         meas_imu_thin_.load(std::memory_order_relaxed),
         buffer_clears_.load(std::memory_order_relaxed),
         imu_cb_starve_.load(std::memory_order_relaxed),
-        imu_stamp_regress_.load(std::memory_order_relaxed));
+        imu_stamp_regress_.load(std::memory_order_relaxed),
+        r.roll_deg, r.pitch_deg, r.yaw_deg,
+        r.grav_x, r.grav_y, r.grav_z,
+        r.bg_x, r.bg_y, r.bg_z, r.ba_x, r.ba_y, r.ba_z,
+        r.res_mean, r.imu_gyr_mean, r.imu_acc_std,
+        r.obs_min, r.obs_mid, r.obs_max,
+        r.obs_weak_x, r.obs_weak_y, r.obs_weak_z);
     // Flush every scan: at 10-20 Hz the cost is negligible and it means a
     // SIGSEGV cannot swallow the rows that explain it.
     std::fflush(scan_f_);
@@ -378,7 +426,13 @@ class Probe
           "imu_stamp_dt_max_ms,preprocess_max_ms,rss_mb,"
           "cum_lidar_buf_max,cum_imu_buf_max,cum_sync_fail,cum_meas_imu_empty,"
           "cum_meas_imu_thin,cum_buffer_clears,cum_imu_cb_starve,"
-          "cum_imu_stamp_regress\n");
+          "cum_imu_stamp_regress,"
+          // pose stability -- appended, so existing column positions do not move
+          "roll_deg,pitch_deg,yaw_deg,"
+          "grav_x,grav_y,grav_z,"
+          "bg_x,bg_y,bg_z,ba_x,ba_y,ba_z,"
+          "res_mean,imu_gyr_mean,imu_acc_std,"
+          "obs_min,obs_mid,obs_max,obs_weak_x,obs_weak_y,obs_weak_z\n");
       std::fflush(scan_f_);
     }
     if (ev_f_) {

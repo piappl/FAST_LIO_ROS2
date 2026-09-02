@@ -47,6 +47,7 @@
 #include <so3_math.h>
 #include <rclcpp/rclcpp.hpp>
 #include <Eigen/Core>
+#include <Eigen/Eigenvalues>
 #include "IMU_Processing.hpp"
 #include <nav_msgs/msg/odometry.hpp>
 #include <nav_msgs/msg/path.hpp>
@@ -946,6 +947,18 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
 
     effct_feat_num = 0;
 
+    // These MUST be reset per EKF iteration, not per scan. h_share_model runs
+    // once per iteration of update_iterated_dyn_share_modified (max_iteration is
+    // 3-10 in the shipped configs), and both clouds are filled with push_back.
+    // Clearing them only in timer_callback left iteration 2+ appending behind
+    // iteration 1's correspondences, while the Jacobian loop below indexes
+    // points[0 .. effct_feat_num) -- so every iteration after the first solved
+    // against the FIRST iteration's points and normals. The filter still
+    // converged, but to the wrong linearisation, which shows up as centimetre
+    // jitter on a stationary platform.
+    laserCloudOri->clear();
+    corr_normvect->clear();
+
     for (int i = 0; i < feats_down_size; i++)
     {
         if (point_selected_surf[i])
@@ -1319,6 +1332,8 @@ private:
 
             normvec->resize(feats_down_size);
             feats_down_world->resize(feats_down_size);
+            // h_share_model clears these itself on every iteration; this just
+            // releases the previous scan's capacity between scans.
             laserCloudOri->clear();
             corr_normvect->clear();
 
@@ -1406,6 +1421,72 @@ private:
                 rec.ext_t_x = state_point.offset_T_L_I(0);
                 rec.ext_t_y = state_point.offset_T_L_I(1);
                 rec.ext_t_z = state_point.offset_T_L_I(2);
+
+                /*** pose stability ***/
+                // euler_cur was refreshed from the post-update state above.
+                rec.roll_deg  = euler_cur(0);
+                rec.pitch_deg = euler_cur(1);
+                rec.yaw_deg   = euler_cur(2);
+                rec.grav_x = state_point.grav[0];
+                rec.grav_y = state_point.grav[1];
+                rec.grav_z = state_point.grav[2];
+                rec.bg_x = state_point.bg(0);
+                rec.bg_y = state_point.bg(1);
+                rec.bg_z = state_point.bg(2);
+                rec.ba_x = state_point.ba(0);
+                rec.ba_y = state_point.ba(1);
+                rec.ba_z = state_point.ba(2);
+                rec.res_mean = res_mean_last;
+
+                // Raw IMU motion for this scan's batch. This is the only
+                // trustworthy "was the platform actually still?" signal -- the
+                // estimated velocity is the thing under suspicion.
+                if (!Measures.imu.empty())
+                {
+                    double sum_g = 0.0, sum_a = 0.0, sum_a2 = 0.0;
+                    for (const auto &m : Measures.imu)
+                    {
+                        const auto &g = m->angular_velocity;
+                        const auto &a = m->linear_acceleration;
+                        sum_g += sqrt(g.x * g.x + g.y * g.y + g.z * g.z);
+                        const double an = sqrt(a.x * a.x + a.y * a.y + a.z * a.z);
+                        sum_a  += an;
+                        sum_a2 += an * an;
+                    }
+                    const double n = double(Measures.imu.size());
+                    rec.imu_gyr_mean = sum_g / n;
+                    const double amean = sum_a / n;
+                    rec.imu_acc_std = sqrt(std::max(0.0, sum_a2 / n - amean * amean));
+                }
+
+                // Translation observability: eigenvalues of the mean plane-normal
+                // scatter matrix over the correspondences the EKF actually used.
+                // Near-equal thirds = every direction constrained. A small
+                // smallest eigenvalue names a direction the geometry does not pin
+                // down, and that is the direction a stationary pose slides along.
+                if (effct_feat_num >= 3 && corr_normvect->points.size() >= (size_t)effct_feat_num)
+                {
+                    M3D scatter = M3D::Zero();
+                    for (int i = 0; i < effct_feat_num; i++)
+                    {
+                        const PointType &nv = corr_normvect->points[i];
+                        const V3D nrm(nv.x, nv.y, nv.z);
+                        scatter += nrm * nrm.transpose();
+                    }
+                    scatter /= double(effct_feat_num);
+                    Eigen::SelfAdjointEigenSolver<M3D> es(scatter);
+                    if (es.info() == Eigen::Success)
+                    {
+                        rec.obs_min = es.eigenvalues()(0);   // ascending
+                        rec.obs_mid = es.eigenvalues()(1);
+                        rec.obs_max = es.eigenvalues()(2);
+                        const V3D weak = es.eigenvectors().col(0);
+                        rec.obs_weak_x = weak(0);
+                        rec.obs_weak_y = weak(1);
+                        rec.obs_weak_z = weak(2);
+                    }
+                }
+
                 flperf::on_scan_done(rec);
             }
 
