@@ -45,20 +45,37 @@ PointCloud2 **every second**; after 30 minutes, three times that. All of it:
 A 60-second bag replay never accumulates enough for any of that to bite. A live
 run does. **First experiment: `map_en: false`.**
 
-### 2. One thread does everything
+### 2. One thread does everything — FIXED, kept here as history
 
-`main()` uses `rclcpp::spin()` — a **single-threaded** executor. So
+This was true and is no longer. It is left in because H1 keeps getting
+re-diagnosed from these paragraphs; read the "now" at the bottom before you
+spend a day on it.
+
+**Then:** `main()` used `rclcpp::spin()` — a **single-threaded** executor. So
 `timer_callback` (IMU integration, voxel downsample, ICP, ikd-Tree insert,
-publishing) shares one thread with `imu_cbk` at 200 Hz and the lidar callback at
-10 Hz. While a scan is being processed, no sensor callback runs at all.
+publishing) shared one thread with `imu_cbk` at 200 Hz and the lidar callback at
+10 Hz. While a scan was being processed, no sensor callback ran at all. The IMU
+subscription was `create_subscription<Imu>(imu_topic, 10, imu_cbk)` — depth 10,
+which at 200 Hz is **50 ms of buffer**. Any processing stall longer than that and
+IMU samples were dropped by the middleware before your code saw them.
 
-The IMU subscription is `create_subscription<Imu>(imu_topic, 10, imu_cbk)` —
-depth 10, which at 200 Hz is **50 ms of buffer**. Any processing stall longer
-than that and IMU samples are dropped by the middleware before your code sees
-them. The lidar subscription uses `SensorDataQoS()`: best-effort, depth 5.
+**Now** (`laserMapping.cpp`): a `MultiThreadedExecutor` with 3 threads and one
+mutually-exclusive `CallbackGroup` each for IMU, lidar and the mapping timers,
+so a scan in ICP no longer blocks `imu_cbk` at all. The IMU queue is **1000**
+deep — 5 s at 200 Hz. `imu_cbk` takes `mtx_buffer` only to `push_back`, and
+cloud preprocessing happens *before* the lock is taken, so the two sensor
+callbacks barely contend. The lidar subscription is
+`SensorDataQoS().keep_last(100)`.
 
-That is what the `--qos loam` vs `--qos greedy` A/B in `stream_monitor.py`
-measures directly.
+The consequence for reading reports: a large `imu_cb_gap_max_ms` is now a
+**latency** symptom, not a loss mechanism. With 5 s of queue, a 20 ms late drain
+loses nothing. The number that decides H1 is `imu_msgs_delta` — how many
+messages actually reached `imu_cbk` — and `meas_imu`, how many the EKF got per
+scan. `analyze.py` reports both under H1.
+
+`stream_monitor.py`'s `--qos loam` profile mirrors those subscriptions and
+**must be kept in sync with the code**, or the A/B measures a subscription the
+node no longer has.
 
 > **Do not "fix" this by swapping in a `MultiThreadedExecutor`.**
 > `sync_packages()` reads and pops `lidar_buffer` / `imu_buffer` / `time_buffer`
@@ -284,9 +301,13 @@ LOAM's exact QoS, one with a deep reliable queue.
               config_file:=mid360.yaml rviz:=false"
 ```
 
-* greedy clean **and** loamqos gappy → the loss is created at the subscriber:
-  shallow queue + starved single thread (causes 1 and 2).
+* greedy clean **and** loamqos gappy → the loss is created at the subscriber
+  (cause 2 — but see the "FIXED" note there before assuming it).
 * both gappy → the loss is upstream: driver, network, or socket buffers.
+* **both `n=0`** → neither reader was on a live topic. This is not a result;
+  see "The `pubs=0 / 0.00 Hz` checklist FAILs" below. `run_test.sh` takes the
+  topics from the config now, so prefer `--config config/<yours>.yaml` (or a
+  `--loam-cmd` containing `config_file:=`) over passing them by hand.
 
 Add `--cloud-topic /Laser_map --cloud-rate 1` to watch the accumulating map
 directly; a climbing `points_mean` is cause 1 caught in the act.
@@ -359,15 +380,45 @@ Still open: both runs used `CYCLONEDDS_URI=file:///usr/config/CycloneDDS.xml`,
 i.e. `perf_env.sh` was never sourced, so the `WhcHigh` half of the H1 fix has
 never actually been in effect. Source it for the next run.
 
-Also note `075418`'s Phase-1 checklist FAILs (`pubs=0`, `0.00 Hz` on every
-topic, in both monitors) contradict the probe, which processed 1853 scans off
-those same topics. The monitors saw nothing; LOAM saw everything. That is a
-`stream_monitor` problem, not a sensor problem — do not read those FAILs as
-data loss.
+### The `pubs=0 / 0.00 Hz` checklist FAILs — root-caused, fixed
+
+Both `075418` and `20260903_065639_phase2` reported `pubs=0` and `0.00 Hz` on
+every topic in both monitors while the probe happily processed thousands of
+scans off those same topics. The monitors saw nothing; LOAM saw everything.
+
+The cause was not discovery and not the sensors: **`run_test.sh` defaulted the
+monitored topics to `/livox/imu` and `/livox/lidar`, while the node reads
+`common.lid_topic` / `common.imu_topic` from its config YAML.** `hap.yaml`
+points at `/livox/hap_4/lidar` and `/imu/data` (external SBG Ellipse A), so both
+monitors subscribed to topics nobody publishes and dutifully recorded nothing.
+
+Two things made that worse than a cosmetic bug:
+
+* section 2 rendered the emptiness as **`FAIL`**, which reads as "the sensor is
+  broken" when it means "the monitor looked in the wrong place";
+* **H1's `loam` vs `greedy` cross-check silently compared two empty datasets**
+  and found `missed~0 vs missed~0`, i.e. it reported no loss because it had no
+  data. That cross-check is the *only* thing that can place a loss at the
+  subscriber rather than upstream, so H1 was left resting entirely on the probe's
+  starvation counter.
+
+Fixed in three places:
+
+* `run_test.sh` now reads `lid_topic` / `imu_topic` / `lidar_type` / `scan_rate`
+  out of the config YAML — auto-detected from `config_file:=` in `--loam-cmd`,
+  or given explicitly with `--config` — and routes a `lidar_type: 1` topic to
+  `--custom-topic` (CustomMsg) instead of `--cloud-topic` (PointCloud2), which
+  is another way to get `n=0`. `--imu-topic` / `--cloud-topic` still override.
+  If it has no config to read and has to guess, it now says so loudly.
+* `analyze.py` prints a `NO DATA` block instead of `FAIL` for a topic with zero
+  messages, names the topics, and states that nothing there is a verdict on the
+  sensors.
+* H1 refuses to draw a conclusion from a monitor that received nothing, and
+  reports the delivered IMU rate from the probe instead.
 
 | id | hypothesis | fix if confirmed |
 |---|---|---|
-| **H1** | loss at the subscriber (shallow QoS + starved single thread) | **applied** — IMU depth 1000, one `CallbackGroup` each for IMU / lidar / the mapping timers, `MultiThreadedExecutor` in `main()`, `mtx_buffer` held across `sync_packages()`, and cloud preprocessing moved out of the buffer lock. Still on you: run with `perf/config/cyclonedds_jetson.xml` so `WhcHigh` is 8 MB (see below) — a throttled reliable writer blocks `publish()` *on that same thread* |
+| **H1** | loss at the subscriber (shallow QoS + starved executor) | **applied** — IMU depth 1000, one `CallbackGroup` each for IMU / lidar / the mapping timers, `MultiThreadedExecutor` in `main()`, `mtx_buffer` held across `sync_packages()`, and cloud preprocessing moved out of the buffer lock. Still on you: run with `perf/config/cyclonedds_jetson.xml` so `WhcHigh` is 8 MB (see below) — a throttled reliable writer blocks `publish()` *on that same thread* |
 | **H2** | loss in the transport (socket buffers, NIC) | `perf/setup_target.sh` (raises `net.core.rmem_max`) plus `SocketReceiveBufferSize` in `perf/config/cyclonedds_jetson.xml`; jumbo frames on the lidar link if available |
 | **H3** | two sensors on one topic / unsynchronised clocks | one topic per sensor, or merge in a node that reorders by stamp; PTP both lidars off one master; point `imu_topic` at a single IMU |
 | **H4** | per-point timestamps corrupting `lidar_end_time` | fix the driver's timestamp mode; verify `off_span_ms_max` ≈ 100 ms; treat a non-positive `max(curvature)` as a hard error rather than clamping it |

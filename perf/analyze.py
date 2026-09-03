@@ -162,6 +162,7 @@ def stream_checklist(monitors):
     Returns True if every check passed.
     """
     all_ok = True
+    nodata = []
     for tag in sorted(monitors):
         m = monitors[tag]
         meta, agg, evs = m["meta"], m["agg"] or [], m["events"] or []
@@ -172,6 +173,31 @@ def stream_checklist(monitors):
             topic = t["topic"]
             rows = [r for r in agg if r.get("topic") == topic]
             is_cloud = any(fnum(r.get("points_mean")) is not None for r in rows)
+
+            # A topic the monitor never received anything on cannot be checked.
+            # Reporting "FAIL: pubs=0" and "FAIL: 0.00 Hz" for it is a lie: it
+            # says the SENSOR is broken when what is actually broken is the
+            # monitor's topic name. The node reads lid_topic/imu_topic from its
+            # config file; this script is told them by run_test.sh, and the two
+            # drift apart the moment a config uses non-default names.
+            if not t.get("messages"):
+                print(f"    {topic}  (NO DATA)")
+                print(f"      [ !!! ] monitor received 0 messages and saw 0 "
+                      f"publishers")
+                print(f"              -> nothing on this topic can be checked. "
+                      f"This is almost always the")
+                print(f"                 WRONG TOPIC NAME, not a dead sensor: "
+                      f"compare it against")
+                print(f"                 common.imu_topic / common.lid_topic in "
+                      f"the config the node")
+                print(f"                 was launched with, and re-run with "
+                      f"--imu-topic/--cloud-topic.")
+                print(f"              -> `ros2 topic list` and `ros2 topic hz "
+                      f"{topic}` confirm it in 5 s.")
+                all_ok = False
+                nodata.append(f"{tag}:{topic}")
+                continue
+
             print(f"    {topic}  ({'cloud' if is_cloud else 'imu'})")
 
             checks = []
@@ -258,7 +284,7 @@ def stream_checklist(monitors):
                     mark = " FAIL"
                     all_ok = False
                 print(f"      [{mark}] {label:<34} {detail}")
-    return all_ok
+    return all_ok, nodata
 
 
 class Finding:
@@ -566,12 +592,28 @@ def main(argv):
     # for you to cross-reference by hand.
     title("2. sensor stream checklist (Phase 1 criteria)")
     if monitors:
-        ok = stream_checklist(monitors)
+        ok, nodata = stream_checklist(monitors)
         print()
-        print("  ALL CHECKS PASSED -- the streams themselves are clean."
-              if ok else
-              "  AT LEAST ONE CHECK FAILED -- fix the stream before blaming LOAM.\n"
-              "  A '?' means the data could not answer it, not that it passed.")
+        if nodata:
+            # Distinguish "the sensors are broken" from "the monitors watched the
+            # wrong topics". The old wording said the first when it meant the
+            # second, which sends you off debugging a healthy sensor.
+            print(f"  {len(nodata)} monitored topic(s) received NOTHING, so this "
+                  f"checklist did not run:")
+            for n in nodata:
+                print(f"    {n}")
+            print("  NOTHING HERE IS A VERDICT ON THE SENSORS. Re-run with the "
+                  "topics the node\n"
+                  "  actually reads -- run_test.sh now takes them from the "
+                  "config file, so\n"
+                  "  pass --config config/<yours>.yaml (or use --loam-cmd with "
+                  "config_file:=).")
+        elif ok:
+            print("  ALL CHECKS PASSED -- the streams themselves are clean.")
+        else:
+            print("  AT LEAST ONE CHECK FAILED -- fix the stream before blaming "
+                  "LOAM.\n"
+                  "  A '?' means the data could not answer it, not that it passed.")
     else:
         print("  no stream_monitor output in this directory")
 
@@ -595,15 +637,30 @@ def main(argv):
                 return t
         return None
 
-    # ---- H1: subscriber-side loss (QoS depth + single-threaded executor) ----
+    # ---- H1: subscriber-side loss (QoS depth + starved executor) ----
     f = mk("H1", "H1  Are messages lost on the SUBSCRIBER side "
                  "(shallow QoS + starved executor)?")
+    imu_nominal = fnum(info.get("imu_rate"), 200.0) or 200.0
+
+    # -- the A/B cross-check: only the loam-vs-greedy pair can place the loss at
+    # -- the subscriber rather than upstream, and it needs BOTH readers to have
+    # -- actually received something.
+    ab_ran = False
     if loam_meta and greedy_meta:
         for topic in (imu_topics or ["/livox/imu"]):
             a = topic_entry(loam_meta, topic)
             b = topic_entry(greedy_meta, topic)
             if not a or not b:
                 continue
+            if not a.get("messages") and not b.get("messages"):
+                # Zero messages on BOTH readers is not "no loss", it is no
+                # measurement. Treating missed_est==0 as evidence here is how a
+                # mistyped topic name turns into a clean bill of health.
+                f.add(f"{topic}: both monitors received 0 messages -- the A/B "
+                      f"cross-check DID NOT RUN (see section 2). Fix the topic "
+                      f"name and re-run before reading this verdict.")
+                continue
+            ab_ran = True
             f.add(f"{topic}: loamqos missed~{a['missed_est']} "
                   f"({a['loss_pct_est']}%) vs greedy missed~{b['missed_est']} "
                   f"({b['loss_pct_est']}%)")
@@ -629,19 +686,95 @@ def main(argv):
               "(drop --no-greedy) to separate subscriber loss from upstream loss")
         for topic in (imu_topics or ["/livox/imu"]):
             a = topic_entry(loam_meta, topic)
-            if a and a["missed_est"] > 5:
+            if a and a.get("messages") and a["missed_est"] > 5:
+                ab_ran = True
                 f.set(POSSIBLE)
                 f.add(f"{topic}: missed~{a['missed_est']} ({a['loss_pct_est']}%)")
+
+    # -- the probe: what the node itself actually received. This does not need a
+    # -- monitor at all, and it is the only measurement that is immune to a wrong
+    # -- topic name -- it counts messages inside imu_cbk.
     if probe:
         starve = fnum(probe[-1].get("cum_imu_cb_starve"), 0.0) or 0.0
         gaps = col(probe, "imu_cb_gap_max_ms")
-        if starve > 0:
-            f.set(LIKELY if starve > 10 else POSSIBLE)
+        deltas = col(probe, "imu_msgs_delta")
+        t_rel = col(probe, "t_rel_s")
+        span = (max(t_rel) - min(t_rel)) if len(t_rel) > 1 else 0.0
+
+        # DELIVERED RATE is the actual test for H1. imu_msgs_delta is incremented
+        # once per imu_cbk invocation, so its sum is exactly how many IMU
+        # messages reached the node. If that matches the publisher's nominal
+        # rate, nothing was lost between the DDS reader and the EKF, however
+        # ragged the callback scheduling looked.
+        short = False
+        if deltas and span > 30.0:
+            got_hz = sum(deltas) / span
+            pct = 100.0 * (1.0 - got_hz / imu_nominal) if imu_nominal else 0.0
+            f.add(f"probe: node received {int(sum(deltas))} IMU msgs in "
+                  f"{span:.0f}s = {got_hz:.1f}Hz vs {imu_nominal:g}Hz nominal "
+                  f"({100.0 - pct:.2f}% of nominal)")
+            if pct > 0.5:
+                short = True
+                f.set(LIKELY)
+                f.add("  -> the node is genuinely receiving fewer IMU messages "
+                      "than are published. THIS is subscriber-side loss.")
+            else:
+                f.add("  -> delivered rate matches the publisher, so no IMU "
+                      "message was dropped on the way to the EKF.")
+
+        # meas_imu is how many IMU samples the EKF got for each scan. A dropped
+        # message shows up here even if the rate averages out.
+        meas = col(probe, "meas_imu")
+        if meas and imu_nominal:
+            expect = imu_nominal / (fnum(info.get("cloud_rate"), 10.0) or 10.0)
+            # +-1 is the honest tolerance: whether a 100 ms window holds 20 or
+            # 21 samples at 200 Hz depends on where the window edge falls, so
+            # only expect-2 and below is a scan that was actually short of IMU.
+            thin = sum(1 for v in meas if v < expect - 1.0)
+            f.add(f"probe: meas_imu per scan (IMU samples handed to the EKF): "
+                  f"min={min(meas):.0f} median={statistics.median(meas):.0f} "
+                  f"expect~{expect:.0f}; {thin}/{len(meas)} scans got fewer than "
+                  f"{expect - 1.0:.0f}")
+
+        # CALLBACK GAPS are a scheduling symptom, not loss. Report them as a rate
+        # so a handful of outliers in a 15-minute run cannot read the same as a
+        # continuously starved executor, and only escalate if the delivered rate
+        # above actually came up short.
+        if starve > 0 and span > 0:
+            per_min = starve * 60.0 / span
             f.add(f"probe: {int(starve)} IMU-callback starvation events "
-                  f"(>15ms between imu_cbk calls)")
+                  f"(>15ms between imu_cbk calls) = {per_min:.2f}/min")
+            if short or per_min > 6.0:
+                f.set(POSSIBLE)
+            else:
+                f.add("  -> at that rate this is scheduling jitter, not loss: "
+                      "the subscription queue is 1000 deep (5 s at 200 Hz), so a "
+                      "late drain costs latency, not messages.")
         if gaps:
+            worst = max(gaps)
             f.add(f"probe: worst gap between imu_cbk invocations = "
-                  f"{max(gaps):.1f}ms (nominal 5ms at 200Hz)")
+                  f"{worst:.1f}ms (nominal {1000.0/imu_nominal:.1f}ms at "
+                  f"{imu_nominal:g}Hz)")
+            # ATTRIBUTION: imu_cb_gap is arrival-to-arrival wall time, so a
+            # publisher that skipped a beat and an executor that was busy look
+            # identical. imu_stamp_dt_max_ms is the same gap measured in the
+            # sensor's own header stamps -- if it moved too, the gap came from
+            # upstream and no amount of executor tuning will touch it.
+            k = max(range(len(gaps)), key=lambda n: gaps[n])
+            rows = [r for r in probe if fnum(r.get("imu_cb_gap_max_ms")) is not None]
+            dt = fnum(rows[k].get("imu_stamp_dt_max_ms")) if k < len(rows) else None
+            if dt is not None:
+                f.add(f"  in that same window the largest HEADER-STAMP gap was "
+                      f"{dt:.1f}ms")
+                if dt > 0.6 * worst:
+                    f.add("  -> the publisher itself skipped a beat (the sensor's "
+                          "own stamps show the gap), so this is upstream, not our "
+                          "executor. Look at the IMU driver, not at QoS.")
+                else:
+                    f.add("  -> the stamps are evenly spaced, so the gap was "
+                          "added on our side: the executor was late draining the "
+                          "queue. Harmless unless the delivered rate above is "
+                          "short.")
     if res:
         top = col(res, "top_thread_cpu_pct")
         thr = col(res, "threads")
@@ -655,10 +788,15 @@ def main(argv):
                 # loss it stays POSSIBLE, so a healthy-but-busy run is not
                 # mislabelled.
                 f.set(POSSIBLE)
-                f.add("  -> one thread is saturated. rclcpp::spin() is single "
-                      "threaded, so that same thread must also drain the IMU and "
-                      "LiDAR queues. On its own this is a risk factor; the "
-                      "verdict is driven by whether messages were actually lost.")
+                f.add("  -> one thread is saturated. The node runs a "
+                      "MultiThreadedExecutor with 3 threads and one "
+                      "mutually-exclusive callback group each for IMU, lidar and "
+                      "the mapping timers, so a busy timer no longer blocks "
+                      "imu_cbk outright -- but a saturated core still delays it. "
+                      "On its own this is a risk factor; the verdict is driven by "
+                      "whether messages were actually lost.")
+    if f.verdict == NODATA and not ab_ran and not probe:
+        f.add("no monitor received data and no probe ran -- H1 was not measured")
 
     # ---- H2: transport-level loss ----
     f = mk("H2", "H2  Are datagrams dropped by the TRANSPORT "

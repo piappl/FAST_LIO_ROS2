@@ -27,6 +27,7 @@ REPO="$(dirname "$HERE")"
 
 NAME="run"
 DURATION=600
+CONFIG_FILE=""
 IMU_TOPICS=()
 CLOUD_TOPICS=()
 CUSTOM_TOPICS=()
@@ -48,8 +49,13 @@ Options:
   --loam-cmd CMD          command that starts LOAM (omit = monitor-only mode)
   --driver-cmd CMD        command that starts the Livox driver (optional)
   --proc-name NAME        process to track for RSS/CPU (default: fastlio_mapping)
-  --imu-topic T           repeatable (default: /livox/imu)
-  --cloud-topic T         repeatable (default: /livox/lidar)
+  --config FILE           node config YAML to read common.lid_topic /
+                          common.imu_topic from. Auto-detected from
+                          --loam-cmd "... config_file:=NAME ..." when omitted.
+  --imu-topic T           repeatable; overrides the config (default: from
+                          --config, else /livox/imu)
+  --cloud-topic T         repeatable; overrides the config (default: from
+                          --config, else /livox/lidar)
   --custom-topic T        repeatable, livox CustomMsg topic (AVIA path)
   --imu-rate HZ           nominal IMU rate (default: 200)
   --cloud-rate HZ         nominal cloud rate (default: 10)
@@ -67,6 +73,7 @@ while [ $# -gt 0 ]; do
     --loam-cmd)      LOAM_CMD="$2"; shift 2 ;;
     --driver-cmd)    DRIVER_CMD="$2"; shift 2 ;;
     --proc-name)     PROC_NAME="$2"; shift 2 ;;
+    --config)        CONFIG_FILE="$2"; shift 2 ;;
     --imu-topic)     IMU_TOPICS+=("$2"); shift 2 ;;
     --cloud-topic)   CLOUD_TOPICS+=("$2"); shift 2 ;;
     --custom-topic)  CUSTOM_TOPICS+=("$2"); shift 2 ;;
@@ -81,8 +88,75 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-[ ${#IMU_TOPICS[@]}   -eq 0 ] && IMU_TOPICS=("/livox/imu")
-[ ${#CLOUD_TOPICS[@]} -eq 0 ] && CLOUD_TOPICS=("/livox/lidar")
+# ------------------------------------------------------- topic resolution --
+# The monitors must subscribe to the topics THE NODE READS, which live in the
+# node's config YAML (common.lid_topic / common.imu_topic). Defaulting to
+# /livox/imu and /livox/lidar and hoping means that the moment a config uses
+# non-default names -- an external IMU on /imu/data, a namespaced lidar on
+# /livox/hap_4/lidar -- both monitors subscribe to dead topics, receive nothing,
+# and the report fills up with "FAIL: pubs=0 / 0.00 Hz" for a run whose streams
+# were in fact perfect. Worse, H1's loam-vs-greedy cross-check silently compares
+# two empty datasets and reports no loss.
+#
+# So: read the topics out of the config instead of guessing.
+
+# Auto-detect the config from `... config_file:=hap.yaml ...` in --loam-cmd.
+if [ -z "$CONFIG_FILE" ] && [ -n "$LOAM_CMD" ]; then
+  _cf="$(printf '%s' "$LOAM_CMD" | grep -oE 'config_file:=[^[:space:]]+' | head -1 | cut -d= -f2-)"
+  _cf="${_cf#:}"
+  if [ -n "$_cf" ]; then
+    if [ -f "$_cf" ]; then CONFIG_FILE="$_cf"
+    elif [ -f "$REPO/config/$_cf" ]; then CONFIG_FILE="$REPO/config/$_cf"
+    else echo "WARNING: config_file:=$_cf named in --loam-cmd but not found" >&2
+    fi
+  fi
+fi
+
+yaml_scalar() {  # $1=file $2=key -> bare value, quotes and trailing comment stripped
+  grep -E "^[[:space:]]*$2:" "$1" 2>/dev/null \
+    | grep -vE '^[[:space:]]*#' | head -1 \
+    | sed -e "s/^[[:space:]]*$2:[[:space:]]*//" -e 's/[[:space:]]*#.*$//' \
+          -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'\$//" \
+          -e 's/[[:space:]]*$//'
+}
+
+CFG_LID=""; CFG_IMU=""; CFG_LTYPE=""; CFG_RATE=""
+if [ -n "$CONFIG_FILE" ] && [ -f "$CONFIG_FILE" ]; then
+  CFG_LID="$(yaml_scalar "$CONFIG_FILE" lid_topic)"
+  CFG_IMU="$(yaml_scalar "$CONFIG_FILE" imu_topic)"
+  CFG_LTYPE="$(yaml_scalar "$CONFIG_FILE" lidar_type)"
+  CFG_RATE="$(yaml_scalar "$CONFIG_FILE" scan_rate)"
+  echo "config: $CONFIG_FILE"
+  echo "  lid_topic=${CFG_LID:-<unset>} imu_topic=${CFG_IMU:-<unset>}" \
+       "lidar_type=${CFG_LTYPE:-?} scan_rate=${CFG_RATE:-?}"
+fi
+
+if [ ${#IMU_TOPICS[@]} -eq 0 ]; then
+  if [ -n "$CFG_IMU" ]; then IMU_TOPICS=("$CFG_IMU")
+  else
+    IMU_TOPICS=("/livox/imu")
+    echo "WARNING: no --imu-topic and no config to read it from; guessing" \
+         "/livox/imu. If the node reads a different topic the monitors will" \
+         "record NOTHING and section 1/2 of the report will be meaningless." >&2
+  fi
+fi
+
+# lidar_type 1 (AVIA) means the lidar topic carries livox CustomMsg, not
+# PointCloud2. Subscribing with the wrong type is another way to get n=0.
+if [ ${#CLOUD_TOPICS[@]} -eq 0 ] && [ ${#CUSTOM_TOPICS[@]} -eq 0 ]; then
+  if [ -n "$CFG_LID" ]; then
+    if [ "$CFG_LTYPE" = "1" ]; then CUSTOM_TOPICS=("$CFG_LID")
+    else                            CLOUD_TOPICS=("$CFG_LID")
+    fi
+  else
+    CLOUD_TOPICS=("/livox/lidar")
+    echo "WARNING: no --cloud-topic and no config to read it from; guessing" \
+         "/livox/lidar (see the IMU warning above)." >&2
+  fi
+fi
+
+# scan_rate is the nominal cloud rate the checklist compares against.
+if [ -n "$CFG_RATE" ] && [ "$CLOUD_RATE" = "10" ]; then CLOUD_RATE="$CFG_RATE"; fi
 
 if [ -z "${ROS_DISTRO:-}" ]; then
   echo "ERROR: ROS is not sourced. Do:" >&2
@@ -107,6 +181,7 @@ echo "run dir: $RUN_DIR"
   echo "cyclonedds_uri=${CYCLONEDDS_URI:-<stock>}"
   echo "ros_domain_id=${ROS_DOMAIN_ID:-0}"
   echo "discovery_range=${ROS_AUTOMATIC_DISCOVERY_RANGE:-<default>}"
+  echo "config_file=${CONFIG_FILE:-<none>}"
   echo "imu_topics=${IMU_TOPICS[*]}"
   echo "cloud_topics=${CLOUD_TOPICS[*]}"
   echo "custom_topics=${CUSTOM_TOPICS[*]:-}"

@@ -4,24 +4,34 @@
 #
 # The HAP delivers roughly 452k points/s against the Mid-360's ~200k, so the
 # preprocess + downsample + ikd-Tree load is about 2.2x for the same scan rate.
-# point_filter_num is raised to compensate; that is the knob to move first if
-# per-scan time exceeds the 100 ms budget at 10 Hz (watch t_total_ms in
-# perf_probe_scan.csv).
+#
+# CORRECTION to what this file used to say: point_filter_num is NOT the knob to
+# move. It is inert for lidar_type: 4 -- Preprocess::mid360_handler() has its
+# `if (i % point_filter_num != 0) continue;` commented out
+# (src/preprocess.cpp:514), so no value of it changes anything. filter_size_surf
+# is the only thinning knob for this sensor; move that if per-scan time
+# approaches the 100 ms budget at 10 Hz (watch t_total_ms in
+# perf_probe_scan.csv, and H5 in the report).
 #
 # lidar_type stays 4: the HAP publishes the same Livox PointCloud2 layout
 # (x,y,z,intensity,tag,line,timestamp) that mid360_handler parses, so that
 # handler applies. scan_line is only used to size some vectors in a fallback
 # path that is disabled in this fork, so its exact value does not affect output.
+# mapping.fov_degree is likewise dead (laserMapping.cpp:1136 computes
+# HALF_FOV_COS and nothing reads it).
+#
+# Estimator parameters track config/hap.yaml so that an A/B against it measures
+# the output settings, not a different filter.
 #
 # TODO before use: set lid_topic / imu_topic and the extrinsics for your mount.
 /**:
     ros__parameters:
         feature_extract_enable: false
-        point_filter_num: 6
-        max_iteration: 3
-        filter_size_surf: 0.5
-        filter_size_map: 0.5
-        cube_side_length: 1000.0
+        point_filter_num: 1          # inert for lidar_type 4 -- see header
+        max_iteration: 10            # cap with early exit; tracks config/hap.yaml
+        filter_size_surf: 0.3        # the only thinning knob for this sensor
+        filter_size_map: 0.3
+        cube_side_length: 500.0      # > 2 * MOV_THRESHOLD * det_range (300 m)
         runtime_pos_log_enable: false
         map_file_path: "./test.pcd"
 

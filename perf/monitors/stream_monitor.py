@@ -16,7 +16,8 @@ Measures, per topic, everything that can starve or poison the FAST-LIO front end
 The QoS profile is selectable, and that is the core of the experiment:
 
   --qos loam    reproduces exactly what laserMapping.cpp asks for
-                (SensorDataQoS for PointCloud2, reliable/depth-10 for Imu)
+                (SensorDataQoS depth-100 for PointCloud2,
+                 reliable/depth-1000 for Imu -- mirrors laserMapping.cpp)
   --qos greedy  reliable, KEEP_LAST depth 2000 -- drops (almost) nothing
 
 Run BOTH at once. Then:
@@ -70,7 +71,7 @@ def stamp_to_sec(stamp) -> float:
 
 
 def make_qos(kind: str, msg_kind: str) -> QoSProfile:
-    """kind: loam|greedy ; msg_kind: cloud|imu"""
+    """kind: loam|greedy ; msg_kind: cloud|custom|imu"""
     if kind == "greedy":
         return QoSProfile(
             reliability=QoSReliabilityPolicy.RELIABLE,
@@ -78,15 +79,36 @@ def make_qos(kind: str, msg_kind: str) -> QoSProfile:
             depth=2000,
             durability=QoSDurabilityPolicy.VOLATILE,
         )
-    # "loam" -- mirror laserMapping.cpp exactly.
+    # "loam" -- mirror laserMapping.cpp exactly. THIS HAS TO BE KEPT IN SYNC:
+    # the whole point of the loam/greedy A/B is that the loam reader has the same
+    # queue the node has, so a profile that has drifted from the code measures a
+    # subscription that no longer exists and the A/B answers nothing.
+    if msg_kind == "custom":
+        # lidar_type 1 (AVIA) takes a different subscription entirely:
+        # create_subscription<CustomMsg>(lid_topic, 100, ...) -> rclcpp default
+        # profile, i.e. RELIABLE depth 100, not SensorDataQoS.
+        return QoSProfile(
+            reliability=QoSReliabilityPolicy.RELIABLE,
+            history=QoSHistoryPolicy.KEEP_LAST,
+            depth=100,
+            durability=QoSDurabilityPolicy.VOLATILE,
+        )
     if msg_kind == "cloud":
-        # create_subscription<PointCloud2>(lid_topic, rclcpp::SensorDataQoS(), ...)
-        return qos_profile_sensor_data
-    # create_subscription<Imu>(imu_topic, 10, ...)  -> rclcpp default = reliable
+        # create_subscription<PointCloud2>(lid_topic,
+        #     rclcpp::SensorDataQoS().keep_last(100), ...)
+        return QoSProfile(
+            reliability=QoSReliabilityPolicy.BEST_EFFORT,
+            history=QoSHistoryPolicy.KEEP_LAST,
+            depth=100,
+            durability=QoSDurabilityPolicy.VOLATILE,
+        )
+    # create_subscription<Imu>(imu_topic, 1000, ...) -> rclcpp default profile
+    # (reliable, volatile) with depth 1000. It was 10 until the IMU callback got
+    # its own callback group; a depth of 10 holds only 50 ms at 200 Hz.
     return QoSProfile(
         reliability=QoSReliabilityPolicy.RELIABLE,
         history=QoSHistoryPolicy.KEEP_LAST,
-        depth=10,
+        depth=1000,
         durability=QoSDurabilityPolicy.VOLATILE,
     )
 
@@ -435,7 +457,7 @@ class StreamMonitor(Node):
                 self.create_subscription(
                     CustomMsg, topic,
                     self._make_custom_cb(topic),
-                    make_qos(args.qos, "cloud"),
+                    make_qos(args.qos, "custom"),
                 )
             )
 
