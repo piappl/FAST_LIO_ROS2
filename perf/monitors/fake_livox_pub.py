@@ -34,6 +34,9 @@ Fault injection:
   --acc-spike-window 2.0    acc std is lopsided (one axis 20x the others)
                             because of a couple of bad samples rather than
                             vibration -- see the IMU init warnings.
+  --acc-vib-amp 0.35        sinusoidal vibration on --acc-vib-axis at
+  --acc-vib-hz 37           --acc-vib-hz. Mechanical vibration, NOT noise: the
+  --acc-vib-axis y          init log separates the two by shape (robust/plain).
   --range-noise-std 0.03    per-point lidar range noise, metres. REQUIRED for any
                             pose-stability or IMU-covariance experiment: with the
                             default exact geometry the plane fits have a zero
@@ -219,6 +222,18 @@ class FakeLivox(Node):
                     ay += a.acc_spike_mag
                 else:
                     az += a.acc_spike_mag
+            if a.acc_vib_amp > 0.0:
+                # Deterministic, single-frequency. Note the IMU samples it at
+                # a.imu_rate, so a vib_hz above imu_rate/2 aliases -- which is
+                # itself realistic and still shows the same robust/plain
+                # signature.
+                v = a.acc_vib_amp * math.sin(2.0 * math.pi * a.acc_vib_hz * t)
+                if a.acc_vib_axis == "x":
+                    ax += v
+                elif a.acc_vib_axis == "y":
+                    ay += v
+                else:
+                    az += v
             m.linear_acceleration.x = ax
             m.linear_acceleration.y = ay
             m.linear_acceleration.z = az
@@ -300,6 +315,13 @@ def main():
     p.add_argument("--acc-spike-mag", type=float, default=1.0)
     p.add_argument("--acc-spike-axis", choices=["x", "y", "z"], default="y")
     p.add_argument("--acc-spike-window", type=float, default=2.0)
+    p.add_argument("--acc-vib-amp", type=float, default=0.0,
+                   help="sinusoidal accelerometer vibration amplitude, m/s^2, on "
+                        "--acc-vib-axis. This is MECHANICAL vibration at a "
+                        "frequency, not noise -- the fault class that shows up as "
+                        "robust/plain ~ 1.5 in the IMU init log")
+    p.add_argument("--acc-vib-hz", type=float, default=37.0)
+    p.add_argument("--acc-vib-axis", choices=["x", "y", "z"], default="y")
     p.add_argument("--range-noise-std", type=float, default=0.0,
                    help="per-point lidar range noise, metres. 0 = geometrically "
                         "exact scene (the default, and useless for judging pose "

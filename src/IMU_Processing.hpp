@@ -47,6 +47,14 @@ const bool time_list(PointType &x, PointType &y) {return (x.curvature < y.curvat
 // from "one sample was a spike", and those call for opposite responses. If the
 // robust spread is much smaller than the plain std, the plain std is describing
 // outliers, not noise, and re-doing the init will not help.
+// Middle of three. Used instead of the largest when a single axis is
+// misbehaving: "worst axis" and "broken axis" are the same axis then, and any
+// recommendation built on it is a recommendation about the fault.
+static double median3(const V3D &v)
+{
+  return v(0) + v(1) + v(2) - v.minCoeff() - v.maxCoeff();
+}
+
 static V3D robust_spread(const vector<V3D> &v)
 {
   V3D out(0, 0, 0);
@@ -468,32 +476,88 @@ void ImuProcess::Process(const MeasureGroup &meas,  esekfom::esekf<state_ikfom, 
                   acc_rob(0), acc_rob(1), acc_rob(2),
                   gyr_rob(0), gyr_rob(1), gyr_rob(2));
 
+      // WHAT KIND of signal is on each axis, not just how big it is.
+      // 1.4826*MAD equals the standard deviation for GAUSSIAN data, so the ratio
+      // robust/plain is a shape test that costs nothing:
+      //     ~1.0  Gaussian noise -- what an IMU at rest should look like
+      //     <0.5  a few outliers inflating the plain std
+      //     ~1.5  a DETERMINISTIC PERIODIC or two-state signal (a sinusoid gives
+      //           exactly 1.048A / 0.707A = 1.48): vibration at a frequency, not
+      //           noise. No covariance setting makes this go away; it is
+      //           mechanical.
+      V3D acc_shape(0, 0, 0), gyr_shape(0, 0, 0);
+      for (int i = 0; i < 3; ++i) {
+        if (acc_std(i) > 0.0) acc_shape(i) = acc_rob(i) / acc_std(i);
+        if (gyr_std(i) > 0.0) gyr_shape(i) = gyr_rob(i) / gyr_std(i);
+      }
+      RCLCPP_INFO(rclcpp::get_logger("laser_mapping"),
+                  "IMU init noise SHAPE robust/plain per axis (1.0 = Gaussian, "
+                  "<0.5 = outliers, ~1.5 = periodic/vibration): "
+                  "acc [%.2f %.2f %.2f] gyr [%.2f %.2f %.2f]",
+                  acc_shape(0), acc_shape(1), acc_shape(2),
+                  gyr_shape(0), gyr_shape(1), gyr_shape(2));
+      for (int i = 0; i < 3; ++i) {
+        if (acc_shape(i) > 1.3) {
+          // A sinusoid of amplitude A has plain std A/sqrt(2).
+          RCLCPP_WARN(rclcpp::get_logger("laser_mapping"),
+                      "Accelerometer axis %c looks PERIODIC, not noisy "
+                      "(robust/plain = %.2f, vs 1.0 for Gaussian): a deterministic "
+                      "vibration of roughly %.3f m/s2 amplitude. Find the source "
+                      "(fan, pump, motor, resonating mount) -- raising acc_cov only "
+                      "tells the filter to ignore the accelerometer that much more.",
+                      "xyz"[i], acc_shape(i), acc_std(i) * 1.41421356);
+        }
+      }
+
       // THE TUNING LINE. mapping.acc_cov / mapping.gyr_cov go straight onto the
       // process-noise diagonal Q (IMU_Processing.hpp: Q.block(0,0)=cov_gyr,
       // Q.block(3,3)=cov_acc), so they are VARIANCES in (m/s^2)^2 and (rad/s)^2
       // -- the square of the numbers just logged. FAST-LIO ships 0.1/0.1, which
       // is a std of 0.32 m/s^2 and 0.32 rad/s (18 deg/s): fine for a cheap
-      // embedded MEMS unit, wildly pessimistic for a good external IMU. Too
-      // pessimistic and the attitude has no faith in the gyro, so it gets driven
-      // by the lidar plane-fit residuals instead and never settles -- which is
-      // what "roll/pitch swings while stationary" in the perf report means.
+      // embedded MEMS unit, often far too pessimistic for a good external IMU.
+      // Too pessimistic and the attitude has no faith in the gyro, so it gets
+      // driven by the lidar plane-fit residuals instead and never settles --
+      // which is what "roll/pitch swings while stationary" in the perf report
+      // means.
       //
-      // The robust spread is used here, not the plain std, so one bad sample
-      // cannot inflate the recommendation.
-      const double a_meas = acc_rob.maxCoeff() * acc_rob.maxCoeff();
-      const double g_meas = gyr_rob.maxCoeff() * gyr_rob.maxCoeff();
+      // The MEDIAN axis, not the worst. This used to use maxCoeff(), which on a
+      // platform with one vibrating axis meant the recommendation was computed
+      // from the fault: a 0.35 m/s2 shake on y gave "acc_cov 1.4", i.e. distrust
+      // the accelerometer 14x more than the stock default. The spread across
+      // axes is reported below so a lopsided unit is visible rather than
+      // averaged away.
+      const double a_rob_med = median3(acc_rob);
+      const double g_rob_med = median3(gyr_rob);
+      const double a_meas = a_rob_med * a_rob_med;
+      const double g_meas = g_rob_med * g_rob_med;
       RCLCPP_INFO(rclcpp::get_logger("laser_mapping"),
-                  "IMU noise measured on THIS unit -> worst-axis variance: "
-                  "acc %.3e (m/s2)^2, gyr %.3e (rad/s)^2. Configured: acc_cov %.3e "
-                  "(%.0fx measured), gyr_cov %.3e (%.0fx measured). A 10x margin "
-                  "over measured is a reasonable starting point: acc_cov %.2e, "
-                  "gyr_cov %.2e. A/B it -- see 'Pose stability' in perf/README.md.",
+                  "IMU noise measured on THIS unit -> MEDIAN-axis variance: "
+                  "acc %.3e (m/s2)^2, gyr %.3e (rad/s)^2 "
+                  "(per-axis acc variance [%.3e %.3e %.3e]). Configured: "
+                  "acc_cov %.3e (%.3gx measured), gyr_cov %.3e (%.3gx measured). "
+                  "A 10x margin over measured is a reasonable starting point: "
+                  "acc_cov %.2e, gyr_cov %.2e. A/B it -- see 'Pose stability' in "
+                  "perf/README.md.",
                   a_meas, g_meas,
+                  acc_rob(0) * acc_rob(0), acc_rob(1) * acc_rob(1),
+                  acc_rob(2) * acc_rob(2),
                   cov_acc_scale.maxCoeff(),
                   a_meas > 0.0 ? cov_acc_scale.maxCoeff() / a_meas : 0.0,
                   cov_gyr_scale.maxCoeff(),
                   g_meas > 0.0 ? cov_gyr_scale.maxCoeff() / g_meas : 0.0,
                   a_meas * 10.0, g_meas * 10.0);
+      if (acc_rob.minCoeff() > 0.0 && acc_rob.maxCoeff() > 5.0 * acc_rob.minCoeff())
+      {
+        RCLCPP_WARN(rclcpp::get_logger("laser_mapping"),
+                    "That acc_cov recommendation is from the MEDIAN axis and the "
+                    "three axes disagree by %.0fx -- it describes the quiet axes, "
+                    "not what the accelerometer is actually being subjected to. "
+                    "Fix the noisy axis before tuning acc_cov, or set acc_cov to "
+                    "%.2e (10x the WORST axis) and accept that the accelerometer "
+                    "is then contributing almost nothing.",
+                    acc_rob.maxCoeff() / acc_rob.minCoeff(),
+                    acc_rob.maxCoeff() * acc_rob.maxCoeff() * 10.0);
+      }
 
       if (acc_std_ratio > 0.02)
       {

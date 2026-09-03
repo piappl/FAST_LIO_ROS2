@@ -492,6 +492,71 @@ more to absorb, which is why `b_acc_cov` has to come with them rather than
 after them. **That table is synthetic — it validates the direction, not the
 magnitudes.** Re-measure on the target.
 
+**It was re-measured, and two thirds of it did not hold.** Runs
+`20260903_095407_sbg_base` and `20260903_102241_sbg_tuned` on the real HAP+SBG
+rig:
+
+| | base `0.1/0.1/1e-4` | tuned `0.02/4e-5/1e-5` |
+|---|---|---|
+| settled p2p worst axis | 52.7 mm | 22.4 mm |
+| roll / pitch / yaw p2p | 0.577 / 0.609 / 0.666° | 0.424 / 0.470 / **0.335**° |
+| speed while still (mean/max) | 9.7 / 41.5 mm/s | 5.9 / 22.8 mm/s |
+| \|ba\| drift | 0.0299 | **0.0416** |
+| \|bg\| drift | not flagged | **0.0018 flagged** |
+
+Better on pose and attitude, worse on both biases — and the position comparison
+is confounded, because the two runs had different stationary spans (904 s vs
+650 s, so 452 s vs 325 s "settled" windows, and peak-to-peak grows with window
+length). What survives is the **gyro** change; see
+`config/hap_sbg_gyr.yaml`, which keeps only that. The accelerometer half was
+wrong for a reason worth knowing:
+
+### `robust/plain` is a shape test, and 1.5 means vibration
+
+`1.4826·MAD` equals the standard deviation for *Gaussian* data, so the ratio of
+the robust spread to the plain std says what KIND of signal an axis carries,
+for free:
+
+| robust/plain | meaning |
+|---|---|
+| ~1.0 | Gaussian noise — what an IMU at rest should look like |
+| <0.5 | a few outlier samples inflating the plain std |
+| **~1.5** | a **deterministic periodic or two-state** signal (a sinusoid gives exactly `1.048A / 0.707A` = 1.48) |
+
+The SBG's accelerometer reads `plain 0.246 / robust 0.373` on y in both runs —
+ratio **1.51**. That is not noise, it is a ~0.35 m/s² vibration at some
+frequency; z carries a smaller one (1.42, ~0.07 m/s²) and x is clean (1.08).
+Reproduced exactly with `fake_livox_pub.py --acc-vib-amp 0.35 --acc-vib-axis y`,
+which the init log reads back as "roughly 0.345 m/s2 amplitude".
+
+Two consequences:
+
+* The worst-axis accelerometer disturbance variance is ~0.148 (m/s²)², so the
+  stock `acc_cov: 0.1` was already the right order and `0.02` told the filter to
+  trust an accelerometer being shaken 7x harder than that. Lowering `acc_cov`
+  makes the accel bias more observable, so the measurement update pushes the
+  vibration into `ba` — which is the `|ba|` regression above, and which no
+  `b_acc_cov` can restrain.
+* The init log's own recommendation used to be computed from `maxCoeff()` of the
+  robust spread — the *worst* axis. On a rig with one vibrating axis the worst
+  axis IS the fault, so it recommended `acc_cov 1.39`, i.e. 14x more pessimistic
+  than stock. It now uses the **median** axis and warns when the three axes
+  disagree by more than 5x.
+
+### `gravity leaks N m/s2 sideways` was never an error
+
+`IMU_init` sets `grav = -mean_acc/|mean_acc| · G` while the filter's world frame
+starts as the body frame (`rot = identity`), so the horizontal component of
+`grav` is **by construction the sensor's mount tilt**. On this rig it was 0.173,
+0.176, 0.175 m/s² across three runs — a fixed ~1.0° mechanical constant. Section
+4 reported it as "1.03 deg of tilt error", claimed it "accelerates the state",
+and advised re-doing the IMU init, which cannot change how a bracket is bolted
+on. The propagation applies `rot·(acc − ba) + grav`, which is ≈0 for a still,
+self-consistent filter whatever frame it picked.
+
+Section 4 now prints the mount tilt as information and, as the actual error
+signal, **how far the gravity direction moved over the span**.
+
 **Reproducing this fault class locally:** `fake_livox_pub.py` needs
 `--range-noise-std` (try `0.03`) for any pose-stability or IMU-covariance
 experiment. Its default scene is geometrically exact, so the plane fits have a

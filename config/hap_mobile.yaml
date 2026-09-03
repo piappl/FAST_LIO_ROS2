@@ -1,0 +1,370 @@
+# config/hap_mobile.yaml -- Livox HAP + external SBG Ellipse A, MOBILE ROBOT,
+# mixed open field and forest.
+#
+# Everything before this file was tuned against a STATIONARY metric (section 4
+# of the perf report: how far the pose wanders while the robot is parked). That
+# metric is now explicitly not the goal -- minor drift is acceptable. Moving
+# changes which parameters matter, and in two cases it reverses the answer.
+#
+# ===========================================================================
+# READ THIS FIRST: the extrinsic is the dominant error when moving, and the
+# value currently in config/hap.yaml is the wrong one.
+# ===========================================================================
+# hap.yaml has extrinsic_T: [0.048, 0.004, 0.103] with extrinsic_R = identity.
+# Those are HAP-internal numbers -- the offset from the lidar origin to the
+# HAP's OWN EMBEDDED IMU. This rig runs an external SBG Ellipse A on /imu/data,
+# a separate box on its own mount, so neither value describes it.
+#
+# WHY THAT DID NOT SHOW UP IN ANY TEST SO FAR: extrinsic_T is a lever arm. The
+# velocity it induces at the lidar is omega x r, so at omega = 0 -- parked -- a
+# wrong r costs exactly nothing. Every run to date was stationary. On a field
+# robot that turns constantly it is a first-order error: at 1 rad/s of yaw, a
+# 0.3 m error in r is 0.3 m/s of unmodelled lidar velocity, applied to every
+# point during undistortion and to the registration itself. extrinsic_R is
+# worse -- it misattributes the gyro's rotation axis, so it corrupts attitude
+# the moment the robot rotates.
+#
+# GET IT BEFORE YOU TRUST ANY POSE FROM THIS FILE. Two ways:
+#
+#  (a) Mechanically. extrinsic_T is the LIDAR ORIGIN EXPRESSED IN THE IMU FRAME
+#      (p_imu = extrinsic_R * p_lidar + extrinsic_T). A drawing that gives the
+#      IMU relative to the lidar is the opposite direction -- negate it, with
+#      extrinsic_R = identity. extrinsic_R itself comes from the two units'
+#      mounting orientations and the SBG's axis convention; if the SBG is
+#      rotated or inverted relative to the HAP, identity is badly wrong.
+#
+#  (b) Estimate it. Set extrinsic_est_en: true, drive 3-5 minutes with VARIED
+#      motion -- yaw both ways, some pitch over bumps, changes of speed; a
+#      straight line at constant velocity identifies nothing -- then read the
+#      converged values out of the probe and pin them here:
+#
+#        tail -400 perf/runs/<run>/perf_probe_scan.csv | awk -F, \
+#          '{for(i=28;i<=30;i++)t[i]+=$i; for(i=70;i<=72;i++)r[i]+=$i; n++}
+#           END{printf "extrinsic_T: [%.4f, %.4f, %.4f]\n", t[28]/n,t[29]/n,t[30]/n;
+#               printf "rotation rpy deg: [%.3f, %.3f, %.3f]\n", r[70]/n,r[71]/n,r[72]/n}'
+#
+#      Columns 28-30 are ext_t_*; 70-72 are ext_r_roll/pitch/yaw in DEGREES,
+#      added for exactly this purpose. Convert the rpy to a rotation matrix for
+#      extrinsic_R. Then set extrinsic_est_en: false for production -- six free
+#      states are six more things to wander, and this file leaves them pinned.
+#
+#      Sanity-check the result: expect translation of the order of your actual
+#      mechanical layout (tens of centimetres if the SBG is a separate box).
+#      A few millimetres means it has not converged -- drive more, and more
+#      aggressively.
+#
+# ===========================================================================
+# WHAT CHANGED FROM config/hap.yaml, AND WHY
+# ===========================================================================
+#
+# COMPUTE BUDGET -- filter_size_surf/map 0.3 -> 0.5
+#   The stationary runs sat at 57.3 ms mean / 64.7 ms p95 / 75 ms max against a
+#   100 ms budget at 10 Hz, and that was with only ~1230 downsampled points from
+#   a 37k-point scan in a small scene. A forest fills the voxel grid far more
+#   completely: pts_down will be several times higher and ICP cost is roughly
+#   linear in it. There is not 4x of headroom in a 65 ms p95, so the leaf size
+#   goes back up. 0.5 loses plane-fit precision, which is the trade this file is
+#   allowed to make.
+#
+#   VERIFY IT ON YOUR ROUTE rather than trusting that estimate -- and find out
+#   which stage actually costs the time before tuning further:
+#     awk -F, 'NR>1{i+=$12;d+=$13;c+=$14;m+=$15;p+=$16;t+=$17;n++;if($19>P)P=$19}
+#       END{printf "imu %.1f  downsample %.1f  ICP %.1f  map_incr %.1f  publish %.1f  total %.1f ms | pts_down max %d\n",
+#       i/n,d/n,c/n,m/n,p/n,t/n,P}' perf/runs/<run>/perf_probe_scan.csv
+#   If ICP dominates, raise filter_size_surf further (0.6, 0.7). If downsample
+#   or preprocess dominates instead, the cheaper lever is decimating points
+#   BEFORE the voxel grid -- but note point_filter_num is inert for
+#   lidar_type: 4 (the `i % point_filter_num` line in
+#   Preprocess::mid360_handler is commented out at src/preprocess.cpp:514).
+#   Restoring it would also silently divide mid360.yaml's point count by 3,
+#   since that config sets point_filter_num: 3 and has been getting no
+#   decimation, so do it deliberately if you do it at all.
+#
+#   Watch H5 in the report. lidar_buf sitting above 0, or p95 approaching 100 ms,
+#   means the leaf size is still too fine.
+#
+# MEMORY OVER A LONG TRAVERSE -- det_range 150 -> 100, cube_side_length 500 -> 400
+#   det_range does NOT filter points; its only use is lasermap_fov_segment()
+#   (src/laserMapping.cpp:275-288), i.e. when the local map cube slides and old
+#   cubes get trimmed. So it sets how much map is RETAINED, which on a stationary
+#   test is irrelevant and on a multi-hour traverse is the whole memory story.
+#   The constraint is cube_side_length > 2 * MOV_THRESHOLD * det_range = 3 *
+#   det_range, so 100/400 is legal with margin (150/500 was legal with only 50 m
+#   of it). Points out to 200 m from the cube centre are still matched, so a
+#   distant tree line in open field is not thrown away.
+#   Watch: ikd-Tree size and RSS in H6. The stationary runs ended at ~3.5k tree
+#   points; a forest will be orders of magnitude more, and that is the number to
+#   keep an eye on.
+#
+# gyr_cov 0.1 -> 1.0e-03  (NOT the 4.0e-05 from config/hap_sbg_gyr.yaml)
+#   4.0e-05 came from the SBG's measured WHITE NOISE while parked (worst-axis
+#   variance 5.7e-06 rad/s squared) and it halved yaw wander on the stationary
+#   runs. But sensor noise is not what limits gyr_cov on rough ground. The
+#   propagation holds each IMU sample constant over dt = 5 ms, and terrain makes
+#   omega change inside that window: at a plausible 10-20 rad/s^2 of angular
+#   acceleration the hold error is dw/dt * dt/2 ~ 0.025-0.05 rad/s, i.e. a
+#   variance of 6e-04 to 2.5e-03 -- two orders above the sensor noise. 1.0e-03
+#   sits in that band and is still 100x below the stock 0.1.
+#
+#   MEASURE IT, do not keep my arithmetic. Drive the actual route and read
+#   imu_gyr_std (column 69) and imu_acc_std (column 62): both are the spread of
+#   the measurement WITHIN one scan's IMU batch, which is precisely what the
+#   constant-over-dt assumption gets wrong.
+#     R=perf/runs/<run>/perf_probe_scan.csv
+#     for spec in 62:imu_acc_std 69:imu_gyr_std; do c=${spec%%:*}; nm=${spec#*:}
+#       tail -n +2 $R | cut -d, -f$c | sort -n | awk -v nm="$nm" '{v[n++]=$1}
+#         END{printf "%-12s p50 %.5f  p95 %.5f  max %.5f\n",
+#             nm, v[int(0.5*n)], v[int(0.95*n)], v[n-1]}'
+#     done
+#   (sort -n rather than awk asort: the default awk on this image is mawk,
+#   which has no asort.)
+#   Then set gyr_cov ~ (gyr_std p95)^2 and acc_cov ~ (acc_std p95)^2. It is an
+#   upper bound -- the batch spans 100 ms, the assumption is per 5 ms step -- so
+#   it errs toward distrusting the IMU, which is the safe direction.
+#
+# acc_cov STAYS at 0.1, and must not be lowered
+#   Established on hardware: the accelerometer y axis carries a ~0.35 m/s2
+#   DETERMINISTIC vibration even parked (init log robust/plain = 1.51, and 1.48
+#   is the exact signature of a sinusoid), so the disturbance variance is already
+#   ~0.148 and stock 0.1 is the right order. Driving only adds to it. The
+#   attempt at 0.02 in config/hap_sbg.yaml pushed the vibration into the biases.
+#
+# b_acc_cov / b_gyr_cov STAY at 1.0e-04
+#   1.0e-05 helped in a synthetic test with a Gaussian accelerometer and did not
+#   transfer to the real rig, where the bias is moved by the measurement update
+#   rather than by its own process noise. Revisit only after the vibration is
+#   fixed at the source.
+#
+# path_en true -> false
+#   publish_path() does path.poses.push_back() with no trimming, ever
+#   (src/laserMapping.cpp:888). It is decimated to every 10th scan, so 1 Hz --
+#   after four hours that is ~14k accumulated poses re-serialised and republished
+#   every second. Harmless in a 15-minute test, pure waste on a field robot. The
+#   code's own comment says "if path is too large, the rvis will crash". Turn it
+#   back on for short debugging runs only.
+#
+# scan_bodyframe_pub_en true -> false
+#   One extra full cloud per scan on /cloud_registered_body. Cost with nothing
+#   subscribed is pure DDS. Turn on only if something consumes it.
+#
+# ===========================================================================
+# DECISIONS ONLY YOU CAN MAKE -- check each before deploying
+# ===========================================================================
+#  * broadcast_tf. Left FALSE, matching hap.yaml. A nav stack usually wants
+#    odom -> base_frame, so you probably want true -- UNLESS something else
+#    (robot_localization, an EKF, a wheel-odom node) already publishes that same
+#    transform, in which case two publishers of one edge is worse than none.
+#  * blind: 0.5. Raise it if the HAP sees any part of the robot. Self-hits are
+#    rigid returns fixed in the sensor frame, so they act as a wall that anchors
+#    the pose to the vehicle instead of the world -- one of the few ways to get a
+#    confidently wrong pose rather than a noisy one. Check with the robot's own
+#    geometry, not by eye in RViz.
+#  * scan_publish_en / dense_publish_en. Left as in hap.yaml. Turn scan
+#    publishing off entirely if nothing downstream consumes /cloud_registered.
+#  * pcd_save_en. Still false. Set true if the point of the mission is a map;
+#    it serialises the ikd-Tree on shutdown and on the /map_save service.
+#  * time_sync_en / time_offset_lidar_to_imu. Left off / 0.0, which the runs
+#    support (clean stamps, imu_lag ~0). But timing error becomes POSITION error
+#    once moving: 10 ms at 3 m/s is 3 cm. If H4 or H8 start firing on a driving
+#    run, this is where to look before anything else.
+#
+# ===========================================================================
+# THE TWO ENVIRONMENTS WANT OPPOSITE LEAF SIZES -- 0.5 IS A COMPROMISE
+# ===========================================================================
+# This is the crux of "mixed field and forest", and one static value cannot
+# serve both:
+#
+#   FOREST      dense returns off trunks, ground and foliage. The voxel grid
+#               fills up, pts_down is high, ICP cost follows. Wants a COARSE
+#               leaf so the scan stays inside the 100 ms budget. There is
+#               abundant structure, so coarse costs little accuracy.
+#   OPEN FIELD  sparse returns, mostly ground plus a distant tree line. Wants a
+#               FINE leaf, because every point is scarce and the geometry is
+#               already nearly degenerate -- thinning what little structure
+#               exists makes it worse.
+#
+# 0.5 is set for the forest case, because overrunning the budget is a hard
+# failure (lidar_buf grows, the pipeline falls behind, H5 fires) whereas a
+# coarser fit in open field is the soft failure this deployment has already
+# accepted. Watch these two columns per environment and re-judge:
+#
+#   awk -F, 'NR>1{if($20<L||!c)L=$20; s+=$20; n++; c=1;
+#     if($17>T)T=$17} END{printf "eff_feat mean %.0f min %.0f | t_total max %.1f ms\n",
+#     s/n, L, T}' perf/runs/<run>/perf_probe_scan.csv
+#
+#   eff_feat (col 20) collapsing toward a hundred or two in open field means 0.5
+#   is starving the solve there -- go to 0.4 or 0.3 and re-check t_total in
+#   forest, since open field is not where the budget is at risk.
+#   t_total max approaching 100 ms in forest means the opposite.
+#
+# If both bind at once -- forest overruns AND open field starves -- one static
+# value has run out of room and the honest fixes are structural: reduce the scan
+# rate, restore the pre-voxel decimation knob (see the note above) so density is
+# cut before the grid rather than by it, or switch configs per environment.
+#
+# ===========================================================================
+# WHAT THIS FILE CANNOT FIX
+# ===========================================================================
+#  * OPEN FIELD IS A DEGENERATE GEOMETRY. Flat ground gives plane normals that
+#    all point the same way, so the horizontal directions and yaw are barely
+#    constrained and the IMU carries the solution alone. Section 4's obs_min
+#    (column 63) is the number that tells you when you are in it -- three roughly
+#    equal thirds near 0.333 means every direction is pinned; a small obs_min
+#    names a direction the geometry does not constrain. No covariance setting
+#    fixes geometry. Expect the drift to arrive in open field and to be corrected
+#    on re-entering structure, and if that is not good enough the answer is
+#    another sensor (GNSS, wheel odometry), not a parameter.
+#  * FOLIAGE IS NOT A RIGID SURFACE. Leaves and thin branches move in wind and
+#    between passes, so plane fits on them are noise dressed as structure.
+#    Expect a higher mean residual in forest than the 2.7-3.0 cm these runs saw;
+#    trunks and ground are what actually carries the solution.
+#  * THE 0.35 m/s2 VIBRATION is mechanical and still there. It is why acc_cov
+#    cannot go down. Finding the source (fan, pump, motor, resonating bracket)
+#    is worth more than any number in this file.
+#
+/**:
+    ros__parameters:
+        feature_extract_enable: false
+        point_filter_num: 1          # inert -- see header. 1 = "no decimation",
+                                     # which is what actually happens today, and
+                                     # stays harmless if that line is restored.
+        max_iteration: 10            # upper bound; early-exits on convergence
+        # THE knob for this sensor. The HAP emits ~452k points/s (~45k per scan
+        # at 10 Hz) and this VoxelGrid is the only thing thinning them. At 0.5 m
+        # the leaf size, not the sensor, sets how well a plane can be fitted --
+        # and the plane fit is what the pose is solved from. 0.3 m gives roughly
+        # 2.5-3x the surface points for a proportional rise in t_icp_ms.
+        #
+        # BACK OFF to 0.4 or 0.5 if the report shows per-scan p95 approaching
+        # 100 ms, or lidar_buf sitting above 0 (section 1 and H5). There was ~8x
+        # headroom when this was written; spend it, but verify.
+        filter_size_surf: 0.5        # was 0.3 -- compute budget, see header
+        # Must track filter_size_surf. The plane fits in h_share_model() come
+        # from the MAP's 5 nearest neighbours, so a coarse map wastes a fine
+        # scan: leaving this at 0.5 would cap the residual no matter how many
+        # scan points you feed it.
+        filter_size_map: 0.5         # must track filter_size_surf
+        # Local map cube. Must stay above 2 * MOV_THRESHOLD * det_range
+        # (= 2 * 1.5 * 100 = 300 m) or lasermap_fov_segment() can never trim.
+        # 1000 m meant it never trimmed in practice and the ikd-Tree grew for
+        # the whole run; 500 m keeps a wide margin while bounding memory. Only
+        # the nearest det_range matters for matching either way.
+        cube_side_length: 400.0      # > 3 * det_range; bounds retained map
+        runtime_pos_log_enable: false
+        map_file_path: "./test.pcd"
+        odom_frame: "odom"
+        base_frame: "hap_4"
+
+        common:
+            lid_topic:  "/livox/hap_4/lidar"
+            imu_topic:  "/imu/data"
+            time_sync_en: false         # ONLY turn on when external time synchronization is really not possible
+            time_offset_lidar_to_imu: 0.0 # Time offset between lidar and IMU calibrated by other algorithms, e.g. LI-Init (can be found in README).
+                                        # This param will take effect no matter what time_sync_en is. So if the time offset is not known exactly, please set as 0.0
+        preprocess:
+            lidar_type: 4                # 1 for Livox serials LiDAR, 2 for Velodyne LiDAR, 3 for ouster LiDAR, 4 for any other pointcloud input
+            scan_line:  6                # inert for lidar_type 4 -- see header
+            # Discards everything within 1 m. Raise it if the sensor sees the
+            # robot's own body (self-hits become a rigid "wall" that anchors the
+            # pose to the vehicle); lower it toward the HAP's 0.5 m minimum if
+            # you are working in tight spaces and need the near returns.
+            blind: 0.5
+            timestamp_unit: 3            # 0-second, 1-milisecond, 2-microsecond, 3-nanosecond.
+            scan_rate: 10
+        mapping:
+            # Seconds of IMU averaged before the filter starts. Gravity is the
+            # MEAN ACCELERATION over this window and the initial gyro bias IS
+            # its mean, so the window length is what makes either estimate worth
+            # anything. Upstream FAST-LIO had no knob here and stopped after
+            # MAX_INI_COUNT samples -- 0.1 s at 200 Hz, i.e. ~20 samples, from
+            # which no bias can be estimated and a single bad sample moves
+            # gravity. Cost: lidar scans are dropped for this long at startup
+            # (the node logs "IMU init in progress"), so this is 1.5 s and not
+            # 5 s. Read the init log before touching the two covariances below:
+            # it now prints the noise measured on YOUR unit and what that
+            # implies for them.
+            imu_init_time: 1.5       # robot is parked at startup; keep it
+            # THESE ARE VARIANCES, not standard deviations: they go straight
+            # onto the process-noise diagonal Q (IMU_Processing.hpp -- Q(0,0) =
+            # cov_gyr, Q(3,3) = cov_acc). 0.1 therefore means a std of 0.32
+            # m/s2 and 0.32 rad/s = 18 deg/s.
+            #
+            # 0.1/0.1 are FAST-LIO's shipped defaults, tuned for a cheap IMU
+            # embedded in the lidar. Measured against an SBG Ellipse A on
+            # /imu/data they are ~800x (acc) and ~200000x (gyr) the unit's real
+            # variance -- i.e. the filter is told to distrust a good gyro almost
+            # completely, so attitude gets driven by the lidar plane-fit
+            # residuals instead and never settles. That is what "roll/pitch
+            # swings 0.77 deg while stationary" in section 4 of the perf report
+            # means.
+            #
+            acc_cov: 0.1             # do NOT lower -- see header
+            gyr_cov: 1.0e-03         # was 0.1; terrain-limited, see header
+            # Accelerometer bias process noise. Section 4 of the report will say
+            # "ba still moving ... -> bias not converged" if this is too loose
+            # for your unit: the bias then chases the tilt-induced gravity
+            # residual instead of settling, and the pose wanders with it.
+            # Lower it (1e-5) only with a before/after stationary run to show it
+            # helped -- too stiff and a real bias never gets corrected.
+            b_acc_cov: 0.0001
+            b_gyr_cov: 0.0001
+            det_range:     100.0     # map trimming only -- see header
+            fov_degree:    120.0         # inert -- see header
+            # extrinsic_T / extrinsic_R describe ONLY the internal geometry
+            # between the HAP's lidar origin and its embedded IMU. They have
+            # nothing to do with how the sensor is mounted on the robot, so
+            # "use the embedded IMU" is exactly the case they are for.
+            #
+            # CONVENTION (verified in src/laserMapping.cpp::pointBodyToWorld):
+            #     p_imu = extrinsic_R * p_lidar + extrinsic_T
+            # so extrinsic_T is the LIDAR ORIGIN EXPRESSED IN THE IMU FRAME,
+            # in metres. If a datasheet gives you the IMU position relative to
+            # the lidar origin, that is the opposite direction: with
+            # extrinsic_R = identity you must NEGATE it.
+            #
+            # PIN THIS. Three free states that keep moving are three more ways
+            # for a stationary pose to wander, and extrinsic_est_en below leaves
+            # them free. Run once for a few minutes with varied motion, read the
+            # converged value out of the probe:
+            #     tail -200 perf/runs/<run>/perf_probe_scan.csv | \
+            #       awk -F, '{s+=$28; t+=$29; u+=$30; n++} END {printf "%.4f %.4f %.4f\n", s/n, t/n, u/n}'
+            # (columns ext_t_x, ext_t_y, ext_t_z), then put it here and set
+            # extrinsic_est_en: false for production. Expect a few centimetres;
+            # anything larger means the estimate has not converged.
+            #
+            # Previous value, kept for reference - check its sign and magnitude
+            # against the HAP mechanical drawing before reinstating it:
+            #     extrinsic_T: [ 0.071, 0.004, 0.103 ]
+            # !!! PLACEHOLDER -- these are HAP-internal embedded-IMU numbers and
+            # !!! do NOT describe an external SBG. Measure or estimate them per
+            # !!! the header BEFORE trusting a pose from this file.
+            extrinsic_T: [0.048, 0.004, 0.103]
+            extrinsic_R: [ 1.000, 0.000, 0.000,
+                           0.000, 1.000, 0.000,
+                           0.000, 0.000, 1.000 ]
+            # true while you are still measuring the extrinsic; false once it is
+            # pinned above. See the note there.
+            extrinsic_est_en: false
+        publish:
+            path_en: false               # unbounded growth -- see header
+            effect_map_en: false         # true: publish Effects
+            # H9: /Laser_map is bounded now (publish_map() serialises the
+            # ikd-Tree, and skips the work entirely when nothing subscribes),
+            # but it is still the most expensive publisher in the node. On for
+            # visualisation, off for production.
+            map_en: false                # true: publish Map cloud
+            scan_publish_en:  true       # false: close all the point cloud output
+            dense_publish_en: false      # false: low down the points number in a global-frame point clouds scan.
+            # One extra full cloud per scan on /cloud_registered_body. Turn off
+            # if nothing subscribes to it -- pure DDS cost otherwise.
+            scan_bodyframe_pub_en: false # off unless something subscribes
+            broadcast_tf: false
+
+        pcd_save:
+            # H9: save_to_pcd() serialises the ikd-Tree -- the map the filter is
+            # actually using, bounded by cube_side_length -- on the /map_save
+            # service and once on shutdown, writing to map_file_path above.
+            pcd_save_en: false
+            # Currently unused: the per-interval writer in publish_frame_world()
+            # is commented out, and the map no longer grows with the frame count.
+            interval: -1

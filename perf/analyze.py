@@ -442,18 +442,49 @@ def pose_stability(probe):
                               "accept the drift along it.")
 
                 # 2. attitude: a tilt error becomes a position ramp
+                #
+                # CAREFUL WITH grav_x/grav_y. IMU_init sets
+                #     grav = -mean_acc / |mean_acc| * G
+                # and the filter's world frame starts as the body frame
+                # (rot = identity). So the horizontal component of grav is, BY
+                # CONSTRUCTION, how far the IMU is tilted from level on its
+                # mount. On a sensor bolted down 1 deg off level it is ~0.17
+                # m/s2 for ever, in every run, and it is NOT an error and NOT a
+                # residual that accelerates anything -- the propagation applies
+                # rot*(acc - ba) + grav, which is ~0 for a still, consistent
+                # filter whatever frame it chose.
+                #
+                # This used to print that constant as "N deg of tilt error" and
+                # tell you to re-do the IMU init, which cannot change a
+                # mechanical mount tilt. What actually signals an attitude
+                # problem is the gravity direction MOVING over the span.
                 pr = [d for n, d in att if n in ("roll", "pitch")]
                 gx = col(sp, "grav_x")
                 gy = col(sp, "grav_y")
+                gz = col(sp, "grav_z")
                 if gx and gy:
                     g_horiz = math.hypot(statistics.fmean(gx), statistics.fmean(gy))
                     tilt_deg = math.degrees(math.asin(min(1.0, g_horiz / 9.81)))
-                    print(f"       gravity leaks {g_horiz:.3f} m/s2 sideways "
-                          f"(= {tilt_deg:.2f} deg of tilt error)")
-                    if g_horiz > 0.05:
-                        print("       -> that residual accelerates the state; integrated "
-                              "twice it IS the position wander. Re-do IMU init with the "
-                              "platform genuinely still (see the acc_std warning at init).")
+                    print(f"       sensor mount is {tilt_deg:.2f} deg off level "
+                          f"(mean horizontal gravity {g_horiz:.3f} m/s2) -- "
+                          f"informational, not an error")
+                    # The real signal: how much the gravity DIRECTION moved.
+                    if gz and len(gx) > 2:
+                        def unit(i):
+                            v = (gx[i], gy[i], gz[i])
+                            n = math.sqrt(sum(c * c for c in v)) or 1.0
+                            return tuple(c / n for c in v)
+                        a0, a1 = unit(0), unit(len(gx) - 1)
+                        dot = max(-1.0, min(1.0, sum(p * q for p, q in zip(a0, a1))))
+                        moved = math.degrees(math.acos(dot))
+                        print(f"       gravity DIRECTION moved {moved:.3f} deg over "
+                              f"the span (this is the attitude error signal)")
+                        if moved > 0.2:
+                            print("       -> the filter's idea of down is drifting. That "
+                                  "tilts the gravity it subtracts, leaving a residual "
+                                  "acceleration; integrated twice it IS the position "
+                                  "wander. Suspect gyro trust (mapping.gyr_cov too "
+                                  "pessimistic) or an unconverged bias below.")
                 if pr and max(pr) > 0.5:
                     print(f"       -> roll/pitch itself swings {max(pr):.2f} deg while "
                           f"stationary; the attitude is not settling, so position cannot.")

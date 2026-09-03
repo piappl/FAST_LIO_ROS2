@@ -126,6 +126,21 @@ struct ScanRecord
   // empty room.
   double obs_min = 0.0, obs_mid = 0.0, obs_max = 0.0;
   double obs_weak_x = 0.0, obs_weak_y = 0.0, obs_weak_z = 0.0;
+
+  // Companion to imu_acc_std for the gyro. Together these two are how you SET
+  // mapping.acc_cov / mapping.gyr_cov for a platform that actually moves: both
+  // are the spread of the measurement WITHIN one scan's IMU batch, which is
+  // exactly what the propagation's hold-each-sample-constant-over-dt assumption
+  // gets wrong. Drive the route, then read the distribution out of this column
+  // instead of guessing from a datasheet. (It is an upper bound: the batch spans
+  // ~100 ms while the assumption is per 5 ms step.)
+  double imu_gyr_std = 0.0;    // std of |omega| over the batch, rad/s
+
+  // Online lidar->IMU extrinsic ROTATION, degrees. ext_t_* already carried the
+  // translation; without these a calibration run with mapping.extrinsic_est_en
+  // could not report half of what it estimated. Only meaningful while
+  // extrinsic_est_en is true.
+  double ext_r_roll = 0.0, ext_r_pitch = 0.0, ext_r_yaw = 0.0;
 };
 
 // -------------------------------------------------------------------- probe --
@@ -311,7 +326,8 @@ class Probe
         "%.5f,%.5f,%.5f,"                    // gravity
         "%.7f,%.7f,%.7f,%.7f,%.7f,%.7f,"     // bg, ba
         "%.6f,%.6f,%.5f,"                    // res_mean, imu_gyr_mean, imu_acc_std
-        "%.5f,%.5f,%.5f,%.4f,%.4f,%.4f\n",   // observability
+        "%.5f,%.5f,%.5f,%.4f,%.4f,%.4f,"     // observability
+        "%.6f,%.4f,%.4f,%.4f\n",              // imu_gyr_std, extrinsic rotation
         now, now - t0_, scans_.load(std::memory_order_relaxed),
         lidar_buf_last_.load(std::memory_order_relaxed),
         imu_buf_last_.load(std::memory_order_relaxed),
@@ -341,7 +357,8 @@ class Probe
         r.bg_x, r.bg_y, r.bg_z, r.ba_x, r.ba_y, r.ba_z,
         r.res_mean, r.imu_gyr_mean, r.imu_acc_std,
         r.obs_min, r.obs_mid, r.obs_max,
-        r.obs_weak_x, r.obs_weak_y, r.obs_weak_z);
+        r.obs_weak_x, r.obs_weak_y, r.obs_weak_z,
+        r.imu_gyr_std, r.ext_r_roll, r.ext_r_pitch, r.ext_r_yaw);
     // Flush every scan: at 10-20 Hz the cost is negligible and it means a
     // SIGSEGV cannot swallow the rows that explain it.
     std::fflush(scan_f_);
@@ -432,7 +449,9 @@ class Probe
           "grav_x,grav_y,grav_z,"
           "bg_x,bg_y,bg_z,ba_x,ba_y,ba_z,"
           "res_mean,imu_gyr_mean,imu_acc_std,"
-          "obs_min,obs_mid,obs_max,obs_weak_x,obs_weak_y,obs_weak_z\n");
+          "obs_min,obs_mid,obs_max,obs_weak_x,obs_weak_y,obs_weak_z,"
+          // appended again -- existing column positions must not move
+          "imu_gyr_std,ext_r_roll,ext_r_pitch,ext_r_yaw\n");
       std::fflush(scan_f_);
     }
     if (ev_f_) {

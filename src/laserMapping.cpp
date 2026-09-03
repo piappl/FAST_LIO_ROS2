@@ -1436,6 +1436,13 @@ private:
                 rec.ext_t_x = state_point.offset_T_L_I(0);
                 rec.ext_t_y = state_point.offset_T_L_I(1);
                 rec.ext_t_z = state_point.offset_T_L_I(2);
+                // Degrees (SO3ToEuler scales by 57.3). Only moves while
+                // mapping.extrinsic_est_en is true; this is what a calibration
+                // run reads back for extrinsic_R.
+                const V3D ext_rpy = SO3ToEuler(state_point.offset_R_L_I);
+                rec.ext_r_roll  = ext_rpy(0);
+                rec.ext_r_pitch = ext_rpy(1);
+                rec.ext_r_yaw   = ext_rpy(2);
 
                 /*** pose stability ***/
                 // euler_cur was refreshed from the post-update state above.
@@ -1458,12 +1465,14 @@ private:
                 // estimated velocity is the thing under suspicion.
                 if (!Measures.imu.empty())
                 {
-                    double sum_g = 0.0, sum_a = 0.0, sum_a2 = 0.0;
+                    double sum_g = 0.0, sum_g2 = 0.0, sum_a = 0.0, sum_a2 = 0.0;
                     for (const auto &m : Measures.imu)
                     {
                         const auto &g = m->angular_velocity;
                         const auto &a = m->linear_acceleration;
-                        sum_g += sqrt(g.x * g.x + g.y * g.y + g.z * g.z);
+                        const double gn = sqrt(g.x * g.x + g.y * g.y + g.z * g.z);
+                        sum_g  += gn;
+                        sum_g2 += gn * gn;
                         const double an = sqrt(a.x * a.x + a.y * a.y + a.z * a.z);
                         sum_a  += an;
                         sum_a2 += an * an;
@@ -1472,6 +1481,8 @@ private:
                     rec.imu_gyr_mean = sum_g / n;
                     const double amean = sum_a / n;
                     rec.imu_acc_std = sqrt(std::max(0.0, sum_a2 / n - amean * amean));
+                    const double gmean = sum_g / n;
+                    rec.imu_gyr_std = sqrt(std::max(0.0, sum_g2 / n - gmean * gmean));
                 }
 
                 // Translation observability: eigenvalues of the mean plane-normal
