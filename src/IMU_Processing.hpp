@@ -24,9 +24,46 @@
 
 /// *************Preconfiguration
 
+// Minimum number of IMU samples for init. This used to be the ONLY stopping
+// condition, which at 200 Hz meant init finished after 0.05 s of data -- and in
+// practice ~20 samples / 0.1 s, because timer_callback discards the first synced
+// package before Process() ever sees it. You cannot average noise out of 20
+// samples, and you certainly cannot estimate a gyro bias from them. It is now a
+// FLOOR, guarding a slow IMU; `mapping.imu_init_time` sets the real window.
 #define MAX_INI_COUNT (10)
 
+// Cap on the samples buffered for the init statistics: 100 s at 200 Hz. Only
+// guards an absurd imu_init_time -- the stats themselves are converged long
+// before this.
+static const size_t IMU_INIT_BUF_MAX = 20000;
+
 const bool time_list(PointType &x, PointType &y) {return (x.curvature < y.curvature);};
+
+// Per-axis robust spread: 1.4826 * median-absolute-deviation, which equals the
+// standard deviation for Gaussian data but -- unlike the plain std -- barely
+// moves when one or two samples are garbage.
+//
+// WHY THIS EXISTS: the plain std cannot distinguish "the platform was vibrating"
+// from "one sample was a spike", and those call for opposite responses. If the
+// robust spread is much smaller than the plain std, the plain std is describing
+// outliers, not noise, and re-doing the init will not help.
+static V3D robust_spread(const vector<V3D> &v)
+{
+  V3D out(0, 0, 0);
+  if (v.size() < 4) return out;
+  vector<double> a(v.size());
+  for (int ax = 0; ax < 3; ++ax)
+  {
+    for (size_t i = 0; i < v.size(); ++i) a[i] = v[i](ax);
+    const size_t mid = a.size() / 2;
+    nth_element(a.begin(), a.begin() + mid, a.end());
+    const double med = a[mid];
+    for (size_t i = 0; i < a.size(); ++i) a[i] = fabs(v[i](ax) - med);
+    nth_element(a.begin(), a.begin() + mid, a.end());
+    out(ax) = 1.4826 * a[mid];
+  }
+  return out;
+}
 
 /// *************IMU Process and undistortion
 class ImuProcess
@@ -47,6 +84,11 @@ class ImuProcess
   void set_acc_cov(const V3D &scaler);
   void set_gyr_bias_cov(const V3D &b_g);
   void set_acc_bias_cov(const V3D &b_a);
+  void set_imu_init_time(double seconds);
+  // True until the init window has closed. While it is true, Process() returns
+  // an empty cloud for EVERY scan by design, so the caller must not report those
+  // scans as faults.
+  bool initialising() const { return imu_need_init_; }
   Eigen::Matrix<double, 12, 12> Q;
   void Process(const MeasureGroup &meas,  esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, PointCloudXYZI::Ptr pcl_un_);
 
@@ -80,6 +122,14 @@ class ImuProcess
   int    init_iter_num = 1;
   bool   b_first_frame_ = true;
   bool   imu_need_init_ = true;
+  // Init window, in seconds of IMU data (mapping.imu_init_time). Gravity comes
+  // from the mean acceleration over this window and the gyro bias IS its mean,
+  // so the window length sets how well either is known.
+  double imu_init_time_ = 1.0;
+  double init_first_imu_time_ = -1.0;
+  double init_last_imu_time_  = -1.0;
+  // Kept only during init, for the robust statistics in the completion log.
+  vector<V3D> init_acc_, init_gyr_;
 };
 
 ImuProcess::ImuProcess()
@@ -110,6 +160,10 @@ void ImuProcess::Reset()
   imu_need_init_    = true;
   start_timestamp_  = -1;
   init_iter_num     = 1;
+  init_first_imu_time_ = -1.0;
+  init_last_imu_time_  = -1.0;
+  init_acc_.clear();
+  init_gyr_.clear();
   v_imu_.clear();
   IMUpose.clear();
   last_imu_.reset(new sensor_msgs::msg::Imu());
@@ -154,6 +208,13 @@ void ImuProcess::set_acc_bias_cov(const V3D &b_a)
   cov_bias_acc = b_a;
 }
 
+void ImuProcess::set_imu_init_time(double seconds)
+{
+  // 0 or negative means "sample floor only", i.e. the old behaviour. Kept so a
+  // config can ask for it explicitly rather than by accident.
+  imu_init_time_ = seconds;
+}
+
 void ImuProcess::IMU_init(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, int &N)
 {
   /** 1. initializing the gravity, gyro bias, acc and gyro covariance
@@ -171,6 +232,8 @@ void ImuProcess::IMU_init(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 
     mean_acc << imu_acc.x, imu_acc.y, imu_acc.z;
     mean_gyr << gyr_acc.x, gyr_acc.y, gyr_acc.z;
     first_lidar_time = meas.lidar_beg_time;
+    init_first_imu_time_ =
+        rclcpp::Time(meas.imu.front()->header.stamp).seconds();
   }
 
   for (const auto &imu : meas.imu)
@@ -188,8 +251,17 @@ void ImuProcess::IMU_init(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 
 
     // cout<<"acc norm: "<<cur_acc.norm()<<" "<<mean_acc.norm()<<endl;
 
+    if (init_acc_.size() < IMU_INIT_BUF_MAX)
+    {
+      init_acc_.push_back(cur_acc);
+      init_gyr_.push_back(cur_gyr);
+    }
+
     N ++;
   }
+  // Advances every call, so the completion test below measures the span of IMU
+  // data actually accumulated rather than wall time.
+  init_last_imu_time_ = rclcpp::Time(meas.imu.back()->header.stamp).seconds();
   state_ikfom init_state = kf_state.get_x();
   init_state.grav = S2(- mean_acc / mean_acc.norm() * G_m_s2);
   
@@ -357,32 +429,101 @@ void ImuProcess::Process(const MeasureGroup &meas,  esekfom::esekf<state_ikfom, 
     last_imu_   = meas.imu.back();
 
     state_ikfom imu_state = kf_state.get_x();
-    if (init_iter_num > MAX_INI_COUNT)
+    // Init completes on TIME, with the sample count as a floor. Both conditions
+    // matter: the time window is what makes the mean acceleration (= gravity)
+    // and the mean angular rate (= gyro bias) worth anything, and the sample
+    // floor keeps a slow or stuttering IMU from finishing on three samples that
+    // happen to span a second.
+    const double init_span =
+        (init_first_imu_time_ > 0.0 && init_last_imu_time_ > init_first_imu_time_)
+            ? (init_last_imu_time_ - init_first_imu_time_)
+            : 0.0;
+    if (init_iter_num > MAX_INI_COUNT && init_span >= imu_init_time_)
     {
       V3D acc_std = cov_acc.cwiseSqrt();
       V3D gyr_std = cov_gyr.cwiseSqrt();
       double acc_std_ratio = acc_std.norm() / mean_acc.norm();
-      cov_acc *= pow(G_m_s2 / mean_acc.norm(), 2);
+      const V3D acc_rob = robust_spread(init_acc_);
+      const V3D gyr_rob = robust_spread(init_gyr_);
       imu_need_init_ = false;
 
+      // The measured variances are DISCARDED here: the filter runs on the
+      // configured mapping.acc_cov / mapping.gyr_cov. Everything above is
+      // diagnostics -- which is exactly why they are logged in full below.
       cov_acc = cov_acc_scale;
       cov_gyr = cov_gyr_scale;
       RCLCPP_INFO(rclcpp::get_logger("laser_mapping"),
-                  "IMU Initial Done: %d samples | gravity [%.3f %.3f %.3f] | |mean acc| %.4f (raw units) | "
-                  "gyro bias [%.4f %.4f %.4f] | acc std [%.4f %.4f %.4f] (%.1f%% of |acc|) | gyr std [%.4f %.4f %.4f]",
-                  init_iter_num - 1,
+                  "IMU Initial Done: %d samples over %.2f s (mapping.imu_init_time %.2f s) | "
+                  "gravity [%.3f %.3f %.3f] | |mean acc| %.4f (raw units) | "
+                  "gyro bias [%.4f %.4f %.4f] | acc std [%.4f %.4f %.4f] (%.2f%% of |acc|) | gyr std [%.5f %.5f %.5f]",
+                  init_iter_num - 1, init_span, imu_init_time_,
                   imu_state.grav[0], imu_state.grav[1], imu_state.grav[2],
                   mean_acc.norm(),
                   mean_gyr(0), mean_gyr(1), mean_gyr(2),
                   acc_std(0), acc_std(1), acc_std(2), acc_std_ratio * 100.0,
                   gyr_std(0), gyr_std(1), gyr_std(2));
+      RCLCPP_INFO(rclcpp::get_logger("laser_mapping"),
+                  "IMU init robust spread (1.4826*MAD, outlier-resistant): "
+                  "acc [%.4f %.4f %.4f] gyr [%.5f %.5f %.5f]",
+                  acc_rob(0), acc_rob(1), acc_rob(2),
+                  gyr_rob(0), gyr_rob(1), gyr_rob(2));
+
+      // THE TUNING LINE. mapping.acc_cov / mapping.gyr_cov go straight onto the
+      // process-noise diagonal Q (IMU_Processing.hpp: Q.block(0,0)=cov_gyr,
+      // Q.block(3,3)=cov_acc), so they are VARIANCES in (m/s^2)^2 and (rad/s)^2
+      // -- the square of the numbers just logged. FAST-LIO ships 0.1/0.1, which
+      // is a std of 0.32 m/s^2 and 0.32 rad/s (18 deg/s): fine for a cheap
+      // embedded MEMS unit, wildly pessimistic for a good external IMU. Too
+      // pessimistic and the attitude has no faith in the gyro, so it gets driven
+      // by the lidar plane-fit residuals instead and never settles -- which is
+      // what "roll/pitch swings while stationary" in the perf report means.
+      //
+      // The robust spread is used here, not the plain std, so one bad sample
+      // cannot inflate the recommendation.
+      const double a_meas = acc_rob.maxCoeff() * acc_rob.maxCoeff();
+      const double g_meas = gyr_rob.maxCoeff() * gyr_rob.maxCoeff();
+      RCLCPP_INFO(rclcpp::get_logger("laser_mapping"),
+                  "IMU noise measured on THIS unit -> worst-axis variance: "
+                  "acc %.3e (m/s2)^2, gyr %.3e (rad/s)^2. Configured: acc_cov %.3e "
+                  "(%.0fx measured), gyr_cov %.3e (%.0fx measured). A 10x margin "
+                  "over measured is a reasonable starting point: acc_cov %.2e, "
+                  "gyr_cov %.2e. A/B it -- see 'Pose stability' in perf/README.md.",
+                  a_meas, g_meas,
+                  cov_acc_scale.maxCoeff(),
+                  a_meas > 0.0 ? cov_acc_scale.maxCoeff() / a_meas : 0.0,
+                  cov_gyr_scale.maxCoeff(),
+                  g_meas > 0.0 ? cov_gyr_scale.maxCoeff() / g_meas : 0.0,
+                  a_meas * 10.0, g_meas * 10.0);
+
       if (acc_std_ratio > 0.02)
       {
         RCLCPP_WARN(rclcpp::get_logger("laser_mapping"),
-                    "High accelerometer variance during IMU init (std = %.1f%% of gravity) — platform was likely "
+                    "High accelerometer variance during IMU init (std = %.2f%% of gravity) — platform was likely "
                     "moving or vibrating. Gravity/bias estimate may be wrong and the filter can diverge "
-                    "('No Effective Points'). Keep the platform still for the first seconds after launch.",
-                    acc_std_ratio * 100.0);
+                    "('No Effective Points'). Keep the platform still for the first %.1f s after launch.",
+                    acc_std_ratio * 100.0, imu_init_time_);
+      }
+      // A spike and a vibrating platform produce the same plain std and need
+      // opposite responses, so say which one this was.
+      if (acc_rob.maxCoeff() > 0.0 && acc_std.maxCoeff() > 4.0 * acc_rob.maxCoeff())
+      {
+        RCLCPP_WARN(rclcpp::get_logger("laser_mapping"),
+                    "Accelerometer std (%.4f) is %.0fx its robust spread (%.4f) — a FEW OUTLIER SAMPLES "
+                    "dominate, not vibration. Re-doing the init will not help; look at the IMU driver "
+                    "and the link for dropped or corrupted samples.",
+                    acc_std.maxCoeff(), acc_std.maxCoeff() / acc_rob.maxCoeff(),
+                    acc_rob.maxCoeff());
+      }
+      // Vibration couples into all three axes. A single noisy axis does not.
+      if (acc_rob.minCoeff() > 0.0 && acc_rob.maxCoeff() > 5.0 * acc_rob.minCoeff())
+      {
+        RCLCPP_WARN(rclcpp::get_logger("laser_mapping"),
+                    "Accelerometer noise is %.0fx larger on one axis than another "
+                    "(robust spread [%.4f %.4f %.4f]) — broadband vibration does not do that. "
+                    "Suspect a loose mount on that axis, a resonating fixture, or a unit/scaling "
+                    "problem in the driver.",
+                    acc_rob.maxCoeff() / acc_rob.minCoeff(),
+                    acc_rob(0), acc_rob(1), acc_rob(2));
       }
       if (mean_gyr.norm() > 0.1)
       {
@@ -390,9 +531,26 @@ void ImuProcess::Process(const MeasureGroup &meas,  esekfom::esekf<state_ikfom, 
                     "Large mean angular velocity during IMU init (%.3f rad/s) — platform was rotating; "
                     "the gyro bias estimate is invalid.", mean_gyr.norm());
       }
+      // Nothing reads these after init; a long window would otherwise hold on
+      // to a few hundred kB for the life of the process.
+      init_acc_.clear();
+      init_acc_.shrink_to_fit();
+      init_gyr_.clear();
+      init_gyr_.shrink_to_fit();
       // ROS_INFO("IMU Initial Done: Gravity: %.4f %.4f %.4f %.4f; state.bias_g: %.4f %.4f %.4f; acc covarience: %.8f %.8f %.8f; gry covarience: %.8f %.8f %.8f",\
       //          imu_state.grav[0], imu_state.grav[1], imu_state.grav[2], mean_acc.norm(), cov_bias_gyr[0], cov_bias_gyr[1], cov_bias_gyr[2], cov_acc[0], cov_acc[1], cov_acc[2], cov_gyr[0], cov_gyr[1], cov_gyr[2]);
       fout_imu.open(DEBUG_FILE_DIR("imu.txt"),ios::out);
+    }
+    else
+    {
+      // Every scan is DROPPED while init runs (cur_pcl_un_->clear() below), so
+      // a longer window means a longer silence before the first odometry. Say
+      // what is happening -- otherwise it reads as a hang.
+      static rclcpp::Clock init_log_clock(RCL_STEADY_TIME);
+      RCLCPP_INFO_THROTTLE(rclcpp::get_logger("laser_mapping"), init_log_clock, 500,
+                           "IMU init in progress: %d samples, %.2f of %.2f s. "
+                           "Keep the platform still. Lidar scans are dropped until this completes.",
+                           init_iter_num - 1, init_span, imu_init_time_);
     }
 
     cur_pcl_un_->clear();

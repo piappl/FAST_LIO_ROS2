@@ -96,6 +96,12 @@ string map_file_path, lid_topic, imu_topic, odom_frame, base_frame;
 double res_mean_last = 0.05, total_residual = 0.0;
 double last_timestamp_lidar = 0, last_timestamp_imu = -1.0;
 double gyr_cov = 0.1, acc_cov = 0.1, b_gyr_cov = 0.0001, b_acc_cov = 0.0001;
+// Seconds of IMU data averaged before the filter starts. Gravity is the mean
+// acceleration over this window and the initial gyro bias IS its mean, so a
+// short window puts a tilt error and a bias error into the state on scan 1.
+// Upstream FAST-LIO had no such knob and stopped after MAX_INI_COUNT samples
+// (~0.1 s at 200 Hz).
+double imu_init_time = 1.0;
 double filter_size_corner_min = 0, filter_size_surf_min = 0, filter_size_map_min = 0, fov_deg = 0;
 double cube_len = 0, HALF_FOV_COS = 0, FOV_DEG = 0, total_distance = 0, lidar_end_time = 0, first_lidar_time = 0.0;
 int    effct_feat_num = 0, time_log_counter = 0, scan_count = 0;
@@ -1067,6 +1073,7 @@ public:
         this->declare_parameter<double>("mapping.acc_cov", 0.1);
         this->declare_parameter<double>("mapping.b_gyr_cov", 0.0001);
         this->declare_parameter<double>("mapping.b_acc_cov", 0.0001);
+        this->declare_parameter<double>("mapping.imu_init_time", 1.0);
         this->declare_parameter<double>("preprocess.blind", 0.01);
         this->declare_parameter<int>("preprocess.lidar_type", AVIA);
         this->declare_parameter<int>("preprocess.scan_line", 16);
@@ -1106,6 +1113,7 @@ public:
         this->get_parameter_or<double>("mapping.acc_cov",acc_cov,0.1);
         this->get_parameter_or<double>("mapping.b_gyr_cov",b_gyr_cov,0.0001);
         this->get_parameter_or<double>("mapping.b_acc_cov",b_acc_cov,0.0001);
+        this->get_parameter_or<double>("mapping.imu_init_time",imu_init_time,1.0);
         this->get_parameter_or<double>("preprocess.blind", p_pre->blind, 0.01);
         this->get_parameter_or<int>("preprocess.lidar_type", p_pre->lidar_type, AVIA);
         this->get_parameter_or<int>("preprocess.scan_line", p_pre->N_SCANS, 16);
@@ -1147,6 +1155,7 @@ public:
         p_imu->set_acc_cov(V3D(acc_cov, acc_cov, acc_cov));
         p_imu->set_gyr_bias_cov(V3D(b_gyr_cov, b_gyr_cov, b_gyr_cov));
         p_imu->set_acc_bias_cov(V3D(b_acc_cov, b_acc_cov, b_acc_cov));
+        p_imu->set_imu_init_time(imu_init_time);
 
         fill(epsi, epsi+23, 0.001);
         kf.init_dyn_share(get_f, df_dx, df_dw, h_share_model, NUM_MAX_ITERATIONS, epsi);
@@ -1265,6 +1274,12 @@ private:
 
             if (feats_undistort == nullptr || feats_undistort->empty())
             {
+                // While the IMU init window is open, Process() deliberately
+                // returns an empty cloud for every scan -- the init progress log
+                // already says so. Warning here would print once per scan for
+                // mapping.imu_init_time seconds and, worse, would put that many
+                // phantom scan_skipped events into the perf report.
+                if (p_imu->initialising()) return;
                 RCLCPP_WARN(this->get_logger(), "No point, skip this scan!\n");
                 flperf::on_skip("feats_undistort_empty");
                 return;

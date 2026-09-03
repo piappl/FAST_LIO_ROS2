@@ -22,6 +22,23 @@ Fault injection:
   --ts-span-ms 400          force an absurd per-point time span (unsynced merge)
   --second-imu-publisher    ALSO publish a 2nd, time-offset IMU stream on the
                             same topic -> reproduces "2x Mid-360 on /livox/imu"
+  --imu-still               stationary IMU: gravity + Gaussian noise instead of
+                            the default sinusoid. This is the mode the IMU-init
+                            and pose-stability checks are about -- the default
+                            motion makes gravity/bias init meaningless by design.
+  --acc-noise-std 0.01      per-axis accelerometer noise, m/s^2
+  --gyr-noise-std 0.0007    per-axis gyro noise, rad/s
+  --acc-spike-count 1       inject N single-sample accelerometer outliers inside
+  --acc-spike-mag 1.0       --acc-spike-window seconds of startup, on
+  --acc-spike-axis y        --acc-spike-axis. Reproduces an init whose per-axis
+  --acc-spike-window 2.0    acc std is lopsided (one axis 20x the others)
+                            because of a couple of bad samples rather than
+                            vibration -- see the IMU init warnings.
+  --range-noise-std 0.03    per-point lidar range noise, metres. REQUIRED for any
+                            pose-stability or IMU-covariance experiment: with the
+                            default exact geometry the plane fits have a zero
+                            residual, the lidar pins the pose outright, and the
+                            IMU covariances cannot make any difference.
 
 Examples:
   # clean reference
@@ -30,6 +47,10 @@ Examples:
   ./fake_livox_pub.py --second-imu-publisher
   # reproduce dropped IMU + collapsed point timestamps
   ./fake_livox_pub.py --drop-imu-frac 0.05 --zero-point-ts
+  # stationary, quiet IMU -- the reference for judging IMU init and pose drift
+  ./fake_livox_pub.py --imu-still
+  # stationary but with two bad accelerometer samples during init
+  ./fake_livox_pub.py --imu-still --acc-spike-count 2 --acc-spike-mag 1.0
 """
 
 import argparse
@@ -73,6 +94,20 @@ def sec_to_stamp(t: float):
     return Time(sec=s, nanosec=int(round((t - s) * 1e9)))
 
 
+def _triple(v, what):
+    """One value -> all three axes; "x,y,z" -> per axis."""
+    parts = [p.strip() for p in str(v).split(",") if p.strip() != ""]
+    try:
+        vals = [float(p) for p in parts]
+    except ValueError:
+        raise SystemExit(f"{what}: expected a number or x,y,z, got {v!r}")
+    if len(vals) == 1:
+        return vals * 3
+    if len(vals) == 3:
+        return vals
+    raise SystemExit(f"{what}: expected 1 or 3 values, got {len(vals)}")
+
+
 class FakeLivox(Node):
     def __init__(self, a):
         super().__init__("fake_livox_pub")
@@ -90,6 +125,10 @@ class FakeLivox(Node):
         self.cloud_n = 0
         self.dropped = 0
         self.rng = random.Random(a.seed)
+        self.acc_spikes_left = a.acc_spike_count
+        self.cloud_rng = np.random.default_rng(a.seed + 1)
+        self.acc_sd = _triple(a.acc_noise_std, "--acc-noise-std")
+        self.gyr_sd = _triple(a.gyr_noise_std, "--gyr-noise-std")
 
         self.create_timer(1.0 / a.cloud_rate, self.tick_cloud)
         self.create_timer(1.0 / a.imu_rate, self.tick_imu)
@@ -111,9 +150,21 @@ class FakeLivox(Node):
         arr = np.zeros(n, dtype=NP_DTYPE)
         ang = np.linspace(0.0, 2.0 * math.pi, n, endpoint=False)
         r = 5.0 + 0.5 * np.sin(4.0 * ang)
+        z = np.linspace(-1.0, 1.0, n)
+        if a.range_noise_std > 0.0:
+            # Per-point range noise. WHY IT MATTERS: without it this scene is
+            # geometrically exact, so the plane fits in h_share_model() have a
+            # zero residual and the lidar pins the pose no matter what the IMU
+            # covariances say. That makes the whole pose-stability fault class --
+            # and any A/B of acc_cov / gyr_cov / b_acc_cov -- unreproducible
+            # here, because those only matter when the lidar constraint is weak.
+            # Set it to the mean residual the perf report shows for your real
+            # scene (section 4, "fit: mean residual") to get a comparable test.
+            r = r + self.cloud_rng.normal(0.0, a.range_noise_std, n)
+            z = z + self.cloud_rng.normal(0.0, a.range_noise_std, n)
         arr["x"] = (r * np.cos(ang)).astype(np.float32)
         arr["y"] = (r * np.sin(ang)).astype(np.float32)
-        arr["z"] = np.linspace(-1.0, 1.0, n).astype(np.float32)
+        arr["z"] = z.astype(np.float32)
         arr["intensity"] = 100.0
         arr["line"] = (np.arange(n) % 4).astype(np.uint8)
 
@@ -140,9 +191,41 @@ class FakeLivox(Node):
 
     # ------------------------------------------------------------------ imu
     def _imu_msg(self, t, phase=0.0):
+        a = self.a
         m = Imu()
         m.header.stamp = sec_to_stamp(t)
-        m.header.frame_id = self.a.frame
+        m.header.frame_id = a.frame
+        if a.imu_still:
+            # Stationary: gravity on z plus white noise. Nothing to average out
+            # except the noise, so this is the case where a gravity/bias init is
+            # meaningful and where "pose wanders while still" means something.
+            ax = self.rng.gauss(0.0, self.acc_sd[0])
+            ay = self.rng.gauss(0.0, self.acc_sd[1])
+            az = 9.81 + self.rng.gauss(0.0, self.acc_sd[2])
+            # A couple of bad samples early on, on ONE axis: that is what makes a
+            # per-axis acc std lopsided without any real vibration.
+            # Spread the remaining budget over the remaining window, so
+            # --acc-spike-count is actually delivered whatever the window size.
+            # That makes one mechanism cover both faults: a few large spikes is
+            # "bad samples", many small ones is "this axis is vibrating".
+            left_s = a.acc_spike_window - (t - self.t0)
+            left_n = max(1.0, left_s * a.imu_rate)
+            if (self.acc_spikes_left > 0 and left_s > 0.0
+                    and self.rng.random() < self.acc_spikes_left / left_n):
+                self.acc_spikes_left -= 1
+                if a.acc_spike_axis == "x":
+                    ax += a.acc_spike_mag
+                elif a.acc_spike_axis == "y":
+                    ay += a.acc_spike_mag
+                else:
+                    az += a.acc_spike_mag
+            m.linear_acceleration.x = ax
+            m.linear_acceleration.y = ay
+            m.linear_acceleration.z = az
+            m.angular_velocity.x = self.rng.gauss(0.0, self.gyr_sd[0])
+            m.angular_velocity.y = self.rng.gauss(0.0, self.gyr_sd[1])
+            m.angular_velocity.z = self.rng.gauss(0.0, self.gyr_sd[2])
+            return m
         w = 2.0 * math.pi * 0.2 * t + phase
         m.linear_acceleration.x = 0.20 * math.sin(w)
         m.linear_acceleration.y = 0.20 * math.cos(w)
@@ -204,6 +287,23 @@ def main():
     p.add_argument("--ts-span-ms", type=float, default=0.0)
     p.add_argument("--second-imu-publisher", action="store_true")
     p.add_argument("--second-imu-offset-ms", type=float, default=7.0)
+    p.add_argument("--imu-still", action="store_true",
+                   help="stationary IMU (gravity + noise) instead of the sinusoid")
+    p.add_argument("--acc-noise-std", default="0.01",
+                   help="accelerometer noise std, m/s^2 (--imu-still). One value "
+                        "for all axes, or x,y,z -- an uneven triple is how a "
+                        "single resonating axis looks, as opposed to broadband "
+                        "vibration or a few bad samples")
+    p.add_argument("--gyr-noise-std", default="0.0007",
+                   help="gyro noise std, rad/s (--imu-still). One value or x,y,z")
+    p.add_argument("--acc-spike-count", type=int, default=0)
+    p.add_argument("--acc-spike-mag", type=float, default=1.0)
+    p.add_argument("--acc-spike-axis", choices=["x", "y", "z"], default="y")
+    p.add_argument("--acc-spike-window", type=float, default=2.0)
+    p.add_argument("--range-noise-std", type=float, default=0.0,
+                   help="per-point lidar range noise, metres. 0 = geometrically "
+                        "exact scene (the default, and useless for judging pose "
+                        "stability -- see the note in tick_cloud)")
     p.add_argument("--duration", type=float, default=0.0)
     a = p.parse_args()
 

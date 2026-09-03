@@ -1,36 +1,113 @@
-# config/hap.yaml -- Livox HAP.
+# config/hap_sbg.yaml -- Livox HAP + EXTERNAL SBG Ellipse A on /imu/data.
 #
-# NOTE: common.imu_topic below is /imu/data, i.e. an EXTERNAL IMU (SBG Ellipse A),
-# not the HAP's embedded one. The extrinsic_T / extrinsic_R comments further down
-# still describe the embedded-IMU case and do NOT apply as written -- with an
-# external unit those two describe the real lidar-to-IMU mount, which is not the
-# identity. Untouched here because it is a separate change; see section 4 of the
-# perf report (observability / gravity leak) before relying on them.
+# TREATMENT config for one A/B. Baseline is config/hap.yaml; this file differs
+# from it in exactly three numbers, all of them about how much the filter trusts
+# the IMU:
 #
-# Tuned against perf/runs/20260902_055532_phase2 (HAP, 177 s) and the Mid-360
-# runs that followed. Read perf/README.md "Pose stability" before changing the
-# estimator numbers, and A/B with perf/config/hap_perf.yaml rather than editing
-# this file in place.
+#     acc_cov     0.1     -> 0.02      (accelerometer white-noise variance)
+#     gyr_cov     0.1     -> 4.0e-05   (gyro white-noise variance)
+#     b_acc_cov   1.0e-04 -> 1.0e-05   (accelerometer bias random walk)
+#
+# Everything else is copied from config/hap.yaml verbatim so the comparison
+# measures these three and nothing else. Re-copy it if that file changes.
 #
 # ---------------------------------------------------------------------------
-# THREE PARAMETERS BELOW DO NOTHING. They are kept because the node declares
-# them and removing them would only make the omission look deliberate. Do not
-# spend an afternoon tuning them:
+# WHY, and where the numbers come from
+# ---------------------------------------------------------------------------
+# acc_cov and gyr_cov are VARIANCES on the process-noise diagonal Q
+# (IMU_Processing.hpp: Q(0,0) = cov_gyr, Q(3,3) = cov_acc), so 0.1 means an
+# assumed noise std of 0.32 m/s2 and 0.32 rad/s (18 deg/s). Those are
+# FAST-LIO's shipped defaults for an IMU embedded in the lidar. The SBG's
+# measured per-sample noise, from the IMU-init log of run 20260903_065639_phase2
 #
-#   point_filter_num  -- inert for lidar_type: 4. Preprocess::mid360_handler()
-#                        has its `if (i % point_filter_num != 0) continue;`
-#                        COMMENTED OUT (src/preprocess.cpp:514). The HAP uses
-#                        that handler, so every point survives preprocessing and
-#                        filter_size_surf below does all the thinning.
-#   preprocess.scan_line -- for lidar_type: 4 it only sizes vectors whose
-#                        consumers are commented out in the same handler.
-#   mapping.fov_degree   -- becomes HALF_FOV_COS at laserMapping.cpp:1136 and is
-#                        then never read again anywhere in the node.
+#     acc std [0.0097 0.2171 0.0387] m/s2      gyr std [0.0007 0.0008 0.0019] rad/s
 #
-# max_iteration is a CAP, not a fixed cost: the ESEKF exits as soon as the
-# increment stays under `limit` for two iterations (esekfom.hpp:507). The
-# measured HAP run peaked at 17.9 ms per scan against a 100 ms budget, so it is
-# not hitting the cap and there is nothing to win by lowering it.
+# is 8-33x smaller in std on the accelerometer and 170-450x smaller on the gyro.
+# Squared, the shipped defaults are ~60x (acc) and ~30000x (gyr) the real
+# variance. A gyro that pessimistic contributes almost nothing to attitude, so
+# attitude is solved from the lidar plane fits instead -- and with 541 effective
+# points at a 2.89 cm mean residual those fits are noisy. Hence "roll/pitch
+# swings 0.774 deg while stationary; the attitude is not settling" in section 4.
+#
+# The values here take the WORST CLEAN AXIS and keep a 10x margin in variance
+# (~3.2x in std) for scale-factor error, temperature drift and the fact that the
+# propagation holds each sample constant over dt:
+#
+#     acc: worst clean axis 0.0387 m/s2 -> var 1.5e-03 -> x10 -> 0.02
+#     gyr: worst axis       0.0019 rad/s -> var 3.6e-06 -> x10 -> 4.0e-05
+#
+# The y-axis acc figure (0.2171) is deliberately EXCLUDED: it is 22x the x axis,
+# which broadband vibration does not do, so it is either a couple of bad samples
+# or one resonating axis. The init log now distinguishes those two and prints a
+# robust (outlier-resistant) spread next to the plain std -- read it and redo
+# this arithmetic from YOUR numbers. The node also prints the implied values
+# directly ("IMU noise measured on THIS unit ... a 10x margin over measured is a
+# reasonable starting point"). These three numbers are a defensible STARTING
+# POINT, not a calibration.
+#
+# b_acc_cov is the accelerometer bias random walk. Accumulated variance over a
+# run is b_acc_cov * dt * T (Q is scaled by dt^2 per step, esekfom.hpp:381), so
+# at 200 Hz over the 900 s run:
+#     1.0e-04 -> bias wander std 0.021 m/s2   (report measured 0.0354 -- i.e.
+#                                              the bias is being driven mostly
+#                                              by its own process noise)
+#     1.0e-05 -> bias wander std 0.0067 m/s2
+# That is the "ba still moving 0.0354 m/s2 -> bias not converged" line, and
+# config/hap.yaml's own comment prescribes 1e-5 for it.
+#
+# b_gyr_cov is LEFT ALONE: the report did not flag the gyro bias. But see the
+# side effect in the ladder below -- if bg drift on your run crosses the 1e-3
+# rad/s that analyze.py flags, it needs the same treatment as b_acc_cov.
+#
+# ---------------------------------------------------------------------------
+# THE THREE CHANGES WERE MEASURED SEPARATELY, and they are not independent
+# ---------------------------------------------------------------------------
+# Run on a SYNTHETIC stationary scene, 150 s each, with the fake publisher's
+# lidar range noise set to 3 cm so the plane-fit residual (2.4-2.6 cm over ~220
+# effective points) roughly matches what run 20260903_065639_phase2 reported for
+# the real scene (2.89 cm over 541 points):
+#
+#   acc_cov/gyr_cov/b_acc_cov   roll p2p  pitch    yaw     |ba| drift  |bg| drift
+#   0.1  / 0.1  / 1e-4 (base)    0.265deg 0.243   0.310      0.0069     0.00005
+#   0.02 / 4e-5 / 1e-4           0.147deg 0.129   0.159      0.0121     0.00056
+#   0.02 / 4e-5 / 1e-5 (this)    0.096deg 0.120   0.141      0.0077     0.00063
+#
+# Read it as: the two covariances are what halve the attitude wander, and they
+# do it by letting the gyro hold the attitude instead of the noisy plane fits.
+# But trusting the accelerometer also gives the ACCEL BIAS more to absorb, so
+# |ba| drift nearly doubles -- that is the middle row. Tightening b_acc_cov to
+# 1e-5 pulls it back to the baseline level AND takes another third off roll.
+# So the three go together: shipping the covariances without b_acc_cov trades an
+# attitude problem for a bias problem.
+#
+# Note |bg| drift rose 10x in both tuned rows (to 6e-4 rad/s). It is still under
+# the 1e-3 that analyze.py flags, and it is the same mechanism -- a trusted gyro
+# has an identifiable bias. Watch it; if your run flags it, try b_gyr_cov 1e-5.
+#
+# CAVEAT, and it is a big one: that table is a SYNTHETIC scene, not your
+# environment. It validates the direction and the mechanism, not the magnitudes.
+# Your own numbers come from the two runs below.
+#
+# ---------------------------------------------------------------------------
+# HOW TO RUN THE A/B  (both stationary, on a genuinely still platform)
+# ---------------------------------------------------------------------------
+#   ./perf/run_test.sh --name sbg_base  --duration 900 \
+#     --loam-cmd "ros2 launch fast_lio mapping.launch.py config_file:=hap.yaml rviz:=false"
+#   ./perf/run_test.sh --name sbg_tuned --duration 900 \
+#     --loam-cmd "ros2 launch fast_lio mapping.launch.py config_file:=hap_sbg.yaml rviz:=false"
+#
+# Compare section 4 of the two reports. What should improve:
+#   - attitude peak-to-peak (was roll 0.649 / pitch 0.774 / yaw 0.407 deg)
+#   - gravity leak (was 0.173 m/s2 = 1.01 deg of tilt error)
+#   - ba drift over the span (was 0.0354 m/s2)
+#   - settled peak-to-peak on the worst axis (was 59.5 mm on z)
+#
+# If it gets WORSE, the most likely cause is that the filter is now stiff enough
+# to hold on to a wrong initial attitude or a wrong extrinsic instead of being
+# dragged into line by the lidar. Walk gyr_cov back up 10x at a time; and note
+# that extrinsic_R below is still the identity while the SBG is a separate unit
+# on its own mount, which is a real error this file does not fix.
+#
 # ---------------------------------------------------------------------------
 /**:
     ros__parameters:
@@ -93,7 +170,7 @@
             # 5 s. Read the init log before touching the two covariances below:
             # it now prints the noise measured on YOUR unit and what that
             # implies for them.
-            imu_init_time: 1.5
+            imu_init_time: 2.0   # 400 samples at 200 Hz; baseline uses 1.5
             # THESE ARE VARIANCES, not standard deviations: they go straight
             # onto the process-noise diagonal Q (IMU_Processing.hpp -- Q(0,0) =
             # cov_gyr, Q(3,3) = cov_acc). 0.1 therefore means a std of 0.32
@@ -108,20 +185,18 @@
             # swings 0.77 deg while stationary" in section 4 of the perf report
             # means.
             #
-            # LEFT AT THE DEFAULTS ON PURPOSE: this file is the A/B BASELINE.
-            # config/hap_sbg.yaml is the same file with these two and b_acc_cov
-            # tuned for the external SBG; run both stationary and compare
-            # section 4. Do not "fix" it here without that comparison.
-            acc_cov: 0.1
-            gyr_cov: 0.1
+            # TUNED FOR THE SBG -- see the header for the derivation. Baseline
+            # config/hap.yaml keeps 0.1/0.1.
+            acc_cov: 0.02        # was 0.1
+            gyr_cov: 4.0e-05     # was 0.1
             # Accelerometer bias process noise. Section 4 of the report will say
             # "ba still moving ... -> bias not converged" if this is too loose
             # for your unit: the bias then chases the tilt-induced gravity
             # residual instead of settling, and the pose wanders with it.
             # Lower it (1e-5) only with a before/after stationary run to show it
             # helped -- too stiff and a real bias never gets corrected.
-            b_acc_cov: 0.0001
-            b_gyr_cov: 0.0001
+            b_acc_cov: 1.0e-05   # was 1.0e-04 -- see header
+            b_gyr_cov: 0.0001    # unchanged on purpose
             det_range:     150.0
             fov_degree:    120.0         # inert -- see header
             # extrinsic_T / extrinsic_R describe ONLY the internal geometry

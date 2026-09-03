@@ -416,6 +416,90 @@ Fixed in three places:
 * H1 refuses to draw a conclusion from a monitor that received nothing, and
   reports the delivered IMU rate from the probe instead.
 
+### IMU init and the process-noise covariances
+
+Two things upstream FAST-LIO gets wrong for any IMU better than the one inside
+the lidar, both found in `20260903_065639_phase2` (HAP + external SBG Ellipse A
+on `/imu/data`) and both fixed or made measurable in the tree:
+
+**1. Init used ~0.1 s of data.** `MAX_INI_COUNT` is 10, and `timer_callback`
+throws away the first synced package before `Process()` sees it, so init
+finished on the second package — 20 samples at 200 Hz. Gravity is the mean
+acceleration over that window and the initial gyro bias *is* its mean, so 20
+samples put a tilt error and a bias error straight into the state, and a single
+bad sample moves gravity. There is now a **`mapping.imu_init_time`** parameter
+(seconds, default 1.0); `MAX_INI_COUNT` survives as a sample floor for slow
+IMUs. Scans are dropped while the window is open — that is deliberate, was
+always true, and is now logged (`IMU init in progress: N samples, X of Y s`)
+instead of showing up as one `No point, skip this scan!` warning per scan.
+
+One consequence to know about: a replay shorter than `imu_init_time` now
+produces **no odometry at all**, where the old 0.1 s window would have
+initialised (badly) and run. The progress log says so every 500 ms rather than
+failing silently, but if you are replaying very short bags, lower the parameter
+for that job rather than wondering why nothing came out.
+
+**2. The init log could not tell vibration from a bad sample.** The phase2 run
+reported `acc std [0.0097 0.2171 0.0387]` — the y axis 22x the x axis — and
+warned "platform was likely moving or vibrating". Broadband vibration does not
+do that to one axis. The init now also logs a **robust spread** (1.4826·MAD,
+outlier-resistant) next to the plain std, and warns differently for the two
+cases. Verified against the fake publisher:
+
+| injected fault | plain acc std | robust spread | warning |
+|---|---|---|---|
+| clean stationary | `[0.010 0.010 0.010]` | flat | none |
+| 2 bad samples on y | `[0.010 0.057 0.010]` | flat | "a FEW OUTLIER SAMPLES dominate, not vibration" |
+| y axis resonating | `[0.010 0.078 0.010]` | lopsided | "9x larger on one axis than another" |
+| broadband vibration | `[0.251 0.243 0.243]` | high, flat | "High accelerometer variance" |
+
+**3. `acc_cov` / `gyr_cov` are variances, and the defaults are for a different
+IMU.** They go straight onto the process-noise diagonal `Q`
+(`IMU_Processing.hpp`: `Q(0,0) = cov_gyr`, `Q(3,3) = cov_acc`), so the shipped
+`0.1` means an assumed noise std of 0.32 m/s² and 0.32 rad/s — 18 °/s. Against
+the SBG's measured per-sample noise that is ~60x (acc) and ~30000x (gyr) the
+real variance in variance terms. A gyro that pessimistic contributes almost
+nothing to attitude, so attitude gets solved from the lidar plane fits instead;
+with 541 effective points at a 2.89 cm residual those are noisy, and the result
+is section 4's "roll/pitch swings 0.774 deg while stationary".
+
+The init log now prints the noise measured on the actual unit and what it
+implies, so this is a reading exercise rather than a guess:
+
+```
+IMU noise measured on THIS unit -> worst-axis variance: acc 1.223e-04 (m/s2)^2,
+gyr 4.456e-07 (rad/s)^2. Configured: acc_cov 1.000e-01 (818x measured),
+gyr_cov 1.000e-01 (224422x measured). A 10x margin over measured is a
+reasonable starting point: acc_cov 1.22e-03, gyr_cov 4.46e-06.
+```
+
+The recommendation is computed from the *robust* spread, so a couple of bad
+samples cannot inflate it.
+
+`config/hap.yaml` is the **A/B baseline** and deliberately keeps `0.1/0.1`;
+`config/hap_sbg.yaml` is the treatment and carries the derivation, the measured
+three-step ladder, and the run commands. The short version of that ladder,
+measured on a synthetic stationary scene tuned to a comparable residual:
+
+| `acc_cov`/`gyr_cov`/`b_acc_cov` | roll p2p | \|ba\| drift |
+|---|---|---|
+| `0.1 / 0.1 / 1e-4` (baseline) | 0.265° | 0.0069 |
+| `0.02 / 4e-5 / 1e-4` | 0.147° | 0.0121 |
+| `0.02 / 4e-5 / 1e-5` (treatment) | 0.096° | 0.0077 |
+
+The covariances halve the attitude wander; doing that also gives the accel bias
+more to absorb, which is why `b_acc_cov` has to come with them rather than
+after them. **That table is synthetic — it validates the direction, not the
+magnitudes.** Re-measure on the target.
+
+**Reproducing this fault class locally:** `fake_livox_pub.py` needs
+`--range-noise-std` (try `0.03`) for any pose-stability or IMU-covariance
+experiment. Its default scene is geometrically exact, so the plane fits have a
+zero residual, the lidar pins the pose outright, and no IMU covariance can make
+any difference — an A/B there returns sub-2 mm and 0.008° for every setting and
+looks like a null result. `--imu-still`, `--acc-noise-std x,y,z`,
+`--acc-spike-count/-mag/-axis` inject the rest.
+
 | id | hypothesis | fix if confirmed |
 |---|---|---|
 | **H1** | loss at the subscriber (shallow QoS + starved executor) | **applied** — IMU depth 1000, one `CallbackGroup` each for IMU / lidar / the mapping timers, `MultiThreadedExecutor` in `main()`, `mtx_buffer` held across `sync_packages()`, and cloud preprocessing moved out of the buffer lock. Still on you: run with `perf/config/cyclonedds_jetson.xml` so `WhcHigh` is 8 MB (see below) — a throttled reliable writer blocks `publish()` *on that same thread* |
