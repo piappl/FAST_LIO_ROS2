@@ -29,7 +29,9 @@ message("Current CPU archtecture: ${CMAKE_SYSTEM_PROCESSOR}")
 # total_residual is accumulated in a separate sequential loop afterwards. So
 # parallelising it is race-free and deterministic.
 #
-# Default OFF so the stock behaviour is unchanged and the A/B is explicit:
+# The aarch64 branch below now enables it too, for exactly the same reason x86
+# does. Set -DFASTLIO_ENABLE_OPENMP_MP=OFF ... to opt out, or use the force knob
+# to enable it on an architecture neither branch matches:
 #   colcon build --cmake-args -DFASTLIO_ENABLE_OPENMP_MP=ON -DFASTLIO_MP_PROC_NUM=4
 # See perf/README.md, experiment E5.
 option(FASTLIO_ENABLE_OPENMP_MP
@@ -41,7 +43,12 @@ if(FASTLIO_ENABLE_OPENMP_MP)
   add_definitions(-DMP_EN)
   add_definitions(-DMP_PROC_NUM=${FASTLIO_MP_PROC_NUM})
   message(STATUS "perf: OpenMP residual loop FORCED ON with ${FASTLIO_MP_PROC_NUM} threads")
-elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "(x86)|(X86)|(amd64)|(AMD64)")
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "(x86)|(X86)|(amd64)|(AMD64)|(aarch64)|(arm64)|(ARM64)")
+  # aarch64 was excluded here, so on a Jetson MP_EN stayed undefined and
+  # h_share_model()'s residual/nearest-neighbour loop -- the dominant per-scan
+  # cost, run max_iteration times per scan -- executed on ONE of eight cores.
+  # The loop writes only per-index data (see the note above), so it is race-free
+  # on any architecture; there was never a reason for the test to be x86-only.
   include(ProcessorCount)
   ProcessorCount(N)
   message("Processer number:  ${N}")

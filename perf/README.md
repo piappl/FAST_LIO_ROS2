@@ -131,6 +131,42 @@ and `sync_packages()` uses **`max(curvature)`** as the scan duration to compute
 `off_span_ms_max`, `zero_frac_max` and friends. At 10 Hz the span should be
 ~100 ms.
 
+### 5b. Whose clock is wrong? (`clock_audit.py`)
+
+`stream_monitor.py` measures the streams; it cannot tell you whether a bad
+number was made here or arrived that way. `clock_audit.py` audits the layers
+underneath and localises the fault:
+
+```bash
+./monitors/clock_audit.py --host-only          # no ROS; run it on the robot AND the PTP master
+
+./monitors/clock_audit.py \
+    --from-merge-config ~/claude_ws/src/auto2_bringup/config/autonomy/pointcloud_merge_default.yaml \
+    --namespace /piap_ibis_medevac \
+    --imu-topic /piap_ibis_medevac/imu/data --duration 20
+```
+
+The decisive number is **`min(now - header.stamp)`** per topic: transport latency
+only ever adds, so the minimum over a window is very nearly the pure sensor-to-host
+clock offset. Read the result like this:
+
+| what you see | where the fault is |
+|---|---|
+| one unit off, the rest agree | that unit's PTP sync |
+| **all** units off by the same amount | host clock or PTP master — not the sensors, not the nodes |
+| offset ≈ ±37 s | TAI/UTC: PTP is TAI, ROS is UTC, and the conversion is missing or doubled |
+| units agree, merged header disagrees | the merger (which unit its `min()` picked, or one dropped by `time_window_sec`) |
+| topics all clean, LOAM still complains | FAST-LIO — see section 5 above |
+| IMU vs lidar skew | `sync_packages()` pairs scans with the wrong IMU samples |
+
+It also checks the kernel `CLOCK_TAI` offset (must be 37 s — a 0 there silently
+breaks every PTP↔system conversion), `phc2sys`/`ptp4l` liveness, the PHC-to-system
+offset read directly off `/dev/ptp*`, NIC hardware timestamping, and recent clock
+**steps** in the journal. A step is worth correlating with any `lidar loop back`
+line in the LOAM log: that is what produces one.
+
+Exit status is 1 when anything was flagged, so it can gate a preflight.
+
 ### Also worth knowing
 
 * **Two Mid-360s, one topic.** FAST-LIO subscribes to exactly one lidar and one
@@ -780,6 +816,9 @@ perf/
 ├── monitors/
 │   ├── stream_monitor.py          rates, gaps, latency, publisher count,
 │   │                              per-point timestamp sanity; QoS selectable
+│   ├── clock_audit.py             the clock LAYER underneath stream_monitor:
+│   │                              host/NTP/PTP, ROS vs system time, per-unit
+│   │                              skew -- "is it my nodes or the system?"
 │   ├── resource_monitor.py        RSS/CPU/per-thread, thermals, clocks,
 │   │                              UDP rcvbuf errors, NIC drops, dmesg
 │   └── fake_livox_pub.py          synthetic sensor with fault injection

@@ -486,7 +486,8 @@ void Preprocess::mid360_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &
   int plsize = pl_orig.points.size();
   if (plsize == 0)
     return;
-  pl_surf.reserve(plsize);
+  const int keep_every = (point_filter_num > 0) ? point_filter_num : 1;
+  pl_surf.reserve(plsize / keep_every + 1);
 
   /*** These variables only works when no point timestamps given ***/
   double omega_l = 0.361 * SCAN_RATE;  // scan angular velocity
@@ -509,9 +510,17 @@ void Preprocess::mid360_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &
     }
   }
 
+  int negative_offsets = 0;
+  double most_negative_ms = 0.0;
+
   for (uint i = 0; i < plsize; ++i)
   {
-    // if (i % point_filter_num != 0) continue;
+    // Keep every Nth point. This is the only decimation FAST-LIO applies to a
+    // Mid-360/merged cloud, and it was commented out: point_filter_num was
+    // silently a no-op here while every other handler honoured it, so a config
+    // asking for 5x reduction got none and h_share_model ran on the full cloud
+    // max_iteration times per scan.
+    if (i % keep_every != 0) continue;
 
     PointType added_pt;
     added_pt.normal_x = 0;
@@ -522,8 +531,19 @@ void Preprocess::mid360_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &
     added_pt.z = pl_orig.points[i].z;
     added_pt.intensity = pl_orig.points[i].intensity;
     added_pt.curvature = (pl_orig.points[i].timestamp - ref_timestamp) / double(1000000); // ns -> ms
-    added_pt.curvature = std::max(0.0f, added_pt.curvature); // clamp: negative offsets indicate timestamp error, but..
-                                                             // in this case its often some floating point error of first point
+    if (added_pt.curvature < 0.0f)
+    {
+      // A point stamped before the cloud header. Sub-microsecond values are the
+      // rounding of an absolute nanosecond count through a double and are
+      // expected on the first point. Anything larger means the header does not
+      // belong to these points -- with a merger that stamps each batch with the
+      // OLDEST member, it means one unit's clock trails the batch header.
+      // Clamping is still the only safe thing to do here, but it is no longer
+      // silent: these points cannot be undistorted correctly.
+      negative_offsets++;
+      if (added_pt.curvature < most_negative_ms) most_negative_ms = added_pt.curvature;
+      added_pt.curvature = 0.0f;
+    }
     // int layer = pl_orig.points[i].line;
     // double yaw_angle = atan2(added_pt.y, added_pt.x) * 57.2957;
 
@@ -558,6 +578,20 @@ void Preprocess::mid360_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &
     if (added_pt.x * added_pt.x + added_pt.y * added_pt.y + added_pt.z * added_pt.z > (blind * blind))
     {
       pl_surf.push_back(std::move(added_pt));
+    }
+  }
+
+  if (most_negative_ms < -0.001)  // 1 us: beyond the double-rounding of the header
+  {
+    static int neg_warn_cnt = 0;
+    if (neg_warn_cnt++ % 100 == 0)
+    {
+      RCLCPP_WARN(rclcpp::get_logger("laser_mapping"),
+                  "%d kept points in this scan are stamped BEFORE the cloud header "
+                  "(worst %.3f ms, scan has %d raw points). Their offsets were clamped to 0, "
+                  "so those points are not undistorted. In a merged cloud this means one "
+                  "unit's clock trails the batch header (seen %d times)",
+                  negative_offsets, most_negative_ms, plsize, neg_warn_cnt);
     }
   }
 }

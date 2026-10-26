@@ -127,6 +127,98 @@ deque<double>                     time_buffer;
 deque<PointCloudXYZI::Ptr>        lidar_buffer;
 deque<sensor_msgs::msg::Imu::ConstSharedPtr> imu_buffer;
 
+// A merged cloud's header stamp is min() over several independently
+// PTP-disciplined units (the merger stamps each batch with the OLDEST member),
+// so it is NOT strictly monotonic: which unit wins that min() flips between
+// frames, and each carries tens of microseconds of PTP servo error. Observed
+// regressions of 5 us and 112 us are jitter, not a loop back, and resetting
+// state on them is far more destructive than ignoring them. Anything larger is
+// a real discontinuity -- bag replay, driver restart, a stepped clock.
+static constexpr double STAMP_JITTER_TOL_S = 1e-3;   // 1 ms
+
+// Bounds on the input queues. Unbounded deques turn "the consumer is slower
+// than the sensor" into unbounded latency and then an OOM kill: at 10 Hz and
+// ~33k points per merged scan, lidar_buffer grows ~10 MB/s. Beyond this depth
+// a scan is older than any pose it could still usefully correct, so dropping
+// it is strictly better than keeping it. Overridable from config.
+//
+// The lidar cap is also the LATENCY bound. It used to be 100 scans, i.e. a node
+// that fell slightly behind the sensor drifted up to 10 s behind reality before
+// anything was dropped -- seen on the robot as odometry reacting to motion
+// later and later the longer it ran. Dropping a scan is cheap for the filter:
+// its IMU samples stay queued and are integrated with the next scan, so the
+// state is still propagated across the gap.
+int max_lidar_buffer = 10;     // 1 s at 10 Hz
+int max_imu_buffer   = 4000;   // 20 s at 200 Hz
+unsigned long lidar_scans_dropped = 0;   // by the cap; read by the health report
+
+// lidar_buffer and time_buffer are strictly parallel: element i of one is the
+// cloud, element i of the other its header stamp. Clearing or trimming just
+// one of them silently offsets every later pair -- meas.lidar ends up carrying
+// a current cloud against a stamp from thousands of scans ago -- and nothing
+// downstream can detect or repair it. Always move them together.
+//
+// lidar_pushed has to be cleared as well: sync_packages_impl copies the front
+// pair into MeasureGroup and can then return (waiting for IMU) with the pair
+// still queued. Leaving the flag set would make the next call skip the copy
+// and pop a different cloud against the stale lidar_end_time.
+//
+// Callers must hold mtx_buffer.
+static void reset_lidar_buffers(const char *site)
+{
+    lidar_buffer.clear();
+    time_buffer.clear();
+    lidar_pushed = false;
+    flperf::on_buffer_clear(site);
+}
+
+static void trim_lidar_buffers(const char *site)
+{
+    if ((int)lidar_buffer.size() <= max_lidar_buffer) return;
+
+    const size_t before = lidar_buffer.size();
+    while ((int)lidar_buffer.size() > max_lidar_buffer)
+    {
+        lidar_buffer.pop_front();
+        if (!time_buffer.empty()) time_buffer.pop_front();
+        lidar_scans_dropped++;
+    }
+    lidar_pushed = false;
+
+    static int trim_warn_cnt = 0;
+    if (trim_warn_cnt++ % 100 == 0)
+    {
+        RCLCPP_WARN(rclcpp::get_logger("laser_mapping"),
+                    "lidar_buffer hit its %d-scan cap (was %zu): dropping the oldest scans. "
+                    "Either processing is slower than the sensor, or scans are waiting for IMU "
+                    "stamps that lag the lidar clock (newest lidar stamp is %+.3f s vs newest IMU; "
+                    "more than ~+0.1 s means clock skew, see the health line). Odometry has a gap "
+                    "here (seen %d times)",
+                    max_lidar_buffer, before, last_timestamp_lidar - last_timestamp_imu,
+                    trim_warn_cnt);
+    }
+    flperf::on_buffer_clear(site);
+}
+
+static void trim_imu_buffer(const char *site)
+{
+    if ((int)imu_buffer.size() <= max_imu_buffer) return;
+
+    const size_t before = imu_buffer.size();
+    while ((int)imu_buffer.size() > max_imu_buffer) imu_buffer.pop_front();
+
+    static int imu_trim_warn_cnt = 0;
+    if (imu_trim_warn_cnt++ % 100 == 0)
+    {
+        RCLCPP_WARN(rclcpp::get_logger("laser_mapping"),
+                    "imu_buffer hit its %d-sample cap (was %zu): dropping the oldest samples. "
+                    "Nothing is consuming IMU -- the lidar stream is stalled or far behind "
+                    "(seen %d times)",
+                    max_imu_buffer, before, imu_trim_warn_cnt);
+    }
+    flperf::on_buffer_clear(site);
+}
+
 PointCloudXYZI::Ptr featsFromMap(new PointCloudXYZI());
 PointCloudXYZI::Ptr feats_undistort(new PointCloudXYZI());
 PointCloudXYZI::Ptr feats_down_body(new PointCloudXYZI());
@@ -155,6 +247,13 @@ state_ikfom state_point;
 vect3 pos_lid;
 
 nav_msgs::msg::Path path;
+// /path used to keep every pose for the life of the process and republish the
+// whole history once a second from timer_callback. That message grows linearly
+// with runtime (~1 pose/s), and on a reliable writer a slow subscriber makes
+// publish() block the mapping thread for longer and longer -- latency that
+// grows with uptime. Keep a rolling window instead. 0 = unbounded (old
+// behaviour).
+int path_max_poses = 1000;
 nav_msgs::msg::Odometry odomAftMapped;
 geometry_msgs::msg::Quaternion geoQuat;
 geometry_msgs::msg::PoseStamped msg_body_pose;
@@ -315,16 +414,31 @@ void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg)
 
     mtx_buffer.lock();
     scan_count ++;
-    if (!is_first_lidar && cur_time < last_timestamp_lidar)
+    bool timeline_reset = false;
+    if (!is_first_lidar && cur_time < last_timestamp_lidar - STAMP_JITTER_TOL_S)
     {
         RCLCPP_ERROR(rclcpp::get_logger("laser_mapping"),
                      "lidar loop back: stamp %.6f is %.3f s older than previous %.6f. "
-                     "Clearing lidar_buffer (%zu clouds) while time_buffer keeps %zu stamps "
-                     "-> cloud/timestamp pairing is DESYNCED from now on!",
+                     "Discarding %zu queued clouds and their stamps and restarting from this one.",
                      cur_time, last_timestamp_lidar - cur_time, last_timestamp_lidar,
-                     lidar_buffer.size(), time_buffer.size());
-        lidar_buffer.clear();
-        flperf::on_buffer_clear("lidar_buffer/standard_pcl_cbk");
+                     lidar_buffer.size());
+        reset_lidar_buffers("lidar_buffer/standard_pcl_cbk");
+        timeline_reset = true;
+    }
+    else if (!is_first_lidar && cur_time < last_timestamp_lidar)
+    {
+        // Sub-millisecond regression: PTP servo jitter on whichever unit is
+        // currently the oldest in the merged batch. Keep the queue, and do not
+        // let last_timestamp_lidar walk backwards.
+        static int jitter_warn_cnt = 0;
+        if (jitter_warn_cnt++ % 1000 == 0)
+        {
+            RCLCPP_DEBUG(rclcpp::get_logger("laser_mapping"),
+                         "lidar stamp went back %.1f us (%.6f after %.6f) -- within the %.1f ms "
+                         "jitter tolerance, queue kept (seen %d times)",
+                         (last_timestamp_lidar - cur_time) * 1e6, cur_time, last_timestamp_lidar,
+                         STAMP_JITTER_TOL_S * 1e3, jitter_warn_cnt);
+        }
     }
     if (is_first_lidar)
     {
@@ -333,7 +447,11 @@ void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg)
 
     lidar_buffer.push_back(ptr);
     time_buffer.push_back(cur_time);
-    last_timestamp_lidar = cur_time;
+    trim_lidar_buffers("lidar_buffer/standard_pcl_cbk/cap");
+    // After a real loop back the new timeline IS the timeline -- clamping to the
+    // old maximum would make every following scan trip the guard again and clear
+    // the queue forever. Only jitter is clamped away.
+    last_timestamp_lidar = timeline_reset ? cur_time : std::max(cur_time, last_timestamp_lidar);
     s_plot11[scan_count % MAXN] = preprocess_s;
     flperf::on_lidar_msg(cur_time, (unsigned long)ptr->points.size(), preprocess_s);
     mtx_buffer.unlock();
@@ -355,22 +473,36 @@ void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
 
     mtx_buffer.lock();
     scan_count ++;
-    if (!is_first_lidar && cur_time < last_timestamp_lidar)
+    bool timeline_reset = false;
+    if (!is_first_lidar && cur_time < last_timestamp_lidar - STAMP_JITTER_TOL_S)
     {
         RCLCPP_ERROR(rclcpp::get_logger("laser_mapping"),
                      "lidar loop back: stamp %.6f is %.3f s older than previous %.6f. "
-                     "Clearing lidar_buffer (%zu clouds) while time_buffer keeps %zu stamps "
-                     "-> cloud/timestamp pairing is DESYNCED from now on!",
+                     "Discarding %zu queued clouds and their stamps and restarting from this one.",
                      cur_time, last_timestamp_lidar - cur_time, last_timestamp_lidar,
-                     lidar_buffer.size(), time_buffer.size());
-        lidar_buffer.clear();
-        flperf::on_buffer_clear("lidar_buffer/livox_pcl_cbk");
+                     lidar_buffer.size());
+        reset_lidar_buffers("lidar_buffer/livox_pcl_cbk");
+        timeline_reset = true;
+    }
+    else if (!is_first_lidar && cur_time < last_timestamp_lidar)
+    {
+        // See standard_pcl_cbk: sub-millisecond regressions are clock jitter.
+        static int jitter_warn_cnt = 0;
+        if (jitter_warn_cnt++ % 1000 == 0)
+        {
+            RCLCPP_DEBUG(rclcpp::get_logger("laser_mapping"),
+                         "lidar stamp went back %.1f us (%.6f after %.6f) -- within the %.1f ms "
+                         "jitter tolerance, queue kept (seen %d times)",
+                         (last_timestamp_lidar - cur_time) * 1e6, cur_time, last_timestamp_lidar,
+                         STAMP_JITTER_TOL_S * 1e3, jitter_warn_cnt);
+        }
     }
     if(is_first_lidar)
     {
         is_first_lidar = false;
     }
-    last_timestamp_lidar = cur_time;
+    // See standard_pcl_cbk: a real loop back adopts the new timeline.
+    last_timestamp_lidar = timeline_reset ? cur_time : std::max(cur_time, last_timestamp_lidar);
 
     if (!time_sync_en && abs(last_timestamp_imu - last_timestamp_lidar) > 10.0 && !imu_buffer.empty() && !lidar_buffer.empty() )
     {
@@ -385,10 +517,11 @@ void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
     }
 
     lidar_buffer.push_back(ptr);
-    time_buffer.push_back(last_timestamp_lidar);
+    time_buffer.push_back(cur_time);
+    trim_lidar_buffers("lidar_buffer/livox_pcl_cbk/cap");
 
     s_plot11[scan_count % MAXN] = preprocess_s;
-    flperf::on_lidar_msg(last_timestamp_lidar, (unsigned long)ptr->points.size(), preprocess_s);
+    flperf::on_lidar_msg(cur_time, (unsigned long)ptr->points.size(), preprocess_s);
     mtx_buffer.unlock();
     sig_buffer.notify_all();
 }
@@ -413,18 +546,25 @@ void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in)
     }
     msg->header.stamp = get_ros_time(timestamp);
 
-    if (timestamp < last_timestamp_imu)
+    bool imu_timeline_reset = false;
+    if (timestamp < last_timestamp_imu - STAMP_JITTER_TOL_S)
     {
         RCLCPP_ERROR(rclcpp::get_logger("laser_mapping"),
                      "imu loop back: stamp %.6f is %.3f s older than previous %.6f, clearing imu_buffer (%zu msgs)",
                      timestamp, last_timestamp_imu - timestamp, last_timestamp_imu, imu_buffer.size());
         imu_buffer.clear();
         flperf::on_buffer_clear("imu_buffer/imu_cbk");
+        imu_timeline_reset = true;
     }
+    // Sub-millisecond regressions are clock jitter, not a loop back, and must
+    // not flush the queue -- see STAMP_JITTER_TOL_S. Two IMUs interleaved on
+    // one topic (perf/README.md, "Two Mid-360s, one topic") regress by a whole
+    // sample period, ~5 ms at 200 Hz, so they still trip the branch above.
 
-    last_timestamp_imu = timestamp;
+    last_timestamp_imu = imu_timeline_reset ? timestamp : std::max(timestamp, last_timestamp_imu);
 
     imu_buffer.push_back(msg);
+    trim_imu_buffer("imu_buffer/imu_cbk/cap");
     flperf::on_imu_msg(timestamp);
     mtx_buffer.unlock();
     sig_buffer.notify_all();
@@ -440,14 +580,22 @@ static bool sync_packages_impl(MeasureGroup &meas)
 
     if (lidar_buffer.size() != time_buffer.size())
     {
+        // No code path should be able to produce this any more -- every clear
+        // and every trim moves both deques together. Keep it as an invariant
+        // check, but repair it instead of running on mispaired data: a cloud
+        // matched to another scan's timestamp silently destroys undistortion
+        // and every pose after it, and there is no way to tell which offset is
+        // the right one once they have diverged.
         static int desync_warn_cnt = 0;
         if (desync_warn_cnt++ % 100 == 0)
         {
             RCLCPP_ERROR(rclcpp::get_logger("laser_mapping"),
-                         "lidar_buffer (%zu) and time_buffer (%zu) sizes differ -> clouds are being paired "
-                         "with wrong timestamps, undistortion is broken until restart (seen %d times)",
+                         "lidar_buffer (%zu) and time_buffer (%zu) sizes differ -- clouds would be paired "
+                         "with the wrong timestamps. Dropping both and resynchronising (seen %d times)",
                          lidar_buffer.size(), time_buffer.size(), desync_warn_cnt);
         }
+        reset_lidar_buffers("desync/sync_packages");
+        return false;
     }
 
     /*** push a lidar scan ***/
@@ -455,6 +603,17 @@ static bool sync_packages_impl(MeasureGroup &meas)
     {
         meas.lidar = lidar_buffer.front();
         meas.lidar_beg_time = time_buffer.front();
+
+        // Nominal scan period from preprocess.scan_rate. lidar_mean_scantime is only
+        // ever a FALLBACK for a scan whose per-point offsets are unusable, so seed it
+        // from the configuration rather than letting the first scan define it alone.
+        const double nominal_scantime = (p_pre->SCAN_RATE > 0) ? 1.0 / double(p_pre->SCAN_RATE) : 0.1;
+        if (lidar_mean_scantime <= 0.0)
+        {
+            lidar_mean_scantime = nominal_scantime;
+            scan_num = 1;
+        }
+
         if (meas.lidar->points.size() <= 1) // time too little
         {
             lidar_end_time = meas.lidar_beg_time + lidar_mean_scantime;
@@ -475,23 +634,40 @@ static bool sync_packages_impl(MeasureGroup &meas)
                                 meas.lidar->points.size(), zero_offset_warn_cnt);
                 }
             }
-            if (max_curvature / double(1000) < 0.5 * lidar_mean_scantime)
+            // Judge the measured span against the CONFIGURED scan rate, not against
+            // lidar_mean_scantime. Comparing it with the mean is self-referential and
+            // latches: one implausible frame -- e.g. the first cloud out of a
+            // multi-lidar merger, which can span seconds while its inputs line up at
+            // startup -- gets averaged into the mean, after which every normal scan
+            // fails the test, takes this fallback, and so never updates the mean
+            // again. The node then runs the whole session with lidar_end_time set
+            // from that poisoned mean, i.e. a scan end far past the last real point,
+            // pairing each scan with IMU samples that do not belong to it.
+            //
+            // The 2x upper bound leaves room for a merged cloud whose inputs are not
+            // published at exactly the same instant; the lower bound catches zeroed or
+            // quantised per-point stamps, which would collapse the IMU window instead.
+            const double scan_span = max_curvature / double(1000);
+            if (scan_span < 0.25 * nominal_scantime || scan_span > 2.0 * nominal_scantime)
             {
                 static int endtime_fallback_warn_cnt = 0;
                 if (endtime_fallback_warn_cnt++ % 100 == 0)
                 {
                     RCLCPP_WARN(rclcpp::get_logger("laser_mapping"),
-                                "Scan-end fallback: max point offset %.1f ms < half of mean scan time %.1f ms — "
-                                "point timestamps look inconsistent (seen %d times)",
-                                max_curvature, lidar_mean_scantime * 1000.0, endtime_fallback_warn_cnt);
+                                "Scan-end fallback: point offsets span %.1f ms, outside [%.1f, %.1f] ms expected "
+                                "for preprocess.scan_rate = %d Hz — using mean scan time %.1f ms instead "
+                                "(check the per-point timestamps and the configured scan rate, seen %d times)",
+                                scan_span * 1000.0, 0.25 * nominal_scantime * 1000.0,
+                                2.0 * nominal_scantime * 1000.0, p_pre->SCAN_RATE,
+                                lidar_mean_scantime * 1000.0, endtime_fallback_warn_cnt);
                 }
                 lidar_end_time = meas.lidar_beg_time + lidar_mean_scantime;
             }
             else
             {
                 scan_num ++;
-                lidar_end_time = meas.lidar_beg_time + max_curvature / double(1000);
-                lidar_mean_scantime += (max_curvature / double(1000) - lidar_mean_scantime) / scan_num;
+                lidar_end_time = meas.lidar_beg_time + scan_span;
+                lidar_mean_scantime += (scan_span - lidar_mean_scantime) / scan_num;
             }
         }
 
@@ -652,7 +828,9 @@ PointCloudXYZI::Ptr pcl_wait_pub(new PointCloudXYZI());
 PointCloudXYZI::Ptr pcl_wait_save(new PointCloudXYZI());
 void publish_frame_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull)
 {
-    if(scan_pub_en)
+    // Transforming and serialising a whole scan is real time on the mapping
+    // thread; skip it when nothing is subscribed.
+    if(scan_pub_en && pubLaserCloudFull->get_subscription_count() > 0)
     {
         PointCloudXYZI::Ptr laserCloudFullRes(dense_pub_en ? feats_undistort : feats_down_body);
         int size = laserCloudFullRes->points.size();
@@ -709,6 +887,7 @@ void publish_frame_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::Share
 
 void publish_frame_body(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull_body)
 {
+    if (pubLaserCloudFull_body->get_subscription_count() == 0) return;   // see publish_frame_world
     int size = feats_undistort->points.size();
     PointCloudXYZI::Ptr laserCloudIMUBody(new PointCloudXYZI(size, 1));
 
@@ -728,6 +907,7 @@ void publish_frame_body(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::Shared
 
 void publish_effect_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudEffect)
 {
+    if (pubLaserCloudEffect->get_subscription_count() == 0) return;   // see publish_frame_world
     PointCloudXYZI::Ptr laserCloudWorld( \
                     new PointCloudXYZI(effct_feat_num, 1));
     for (int i = 0; i < effct_feat_num; i++)
@@ -888,7 +1068,14 @@ void publish_path(rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath)
     if (jjj % 10 == 0)
     {
         path.poses.push_back(msg_body_pose);
-        pubPath->publish(path);
+        if (path_max_poses > 0 && (int)path.poses.size() > path_max_poses)
+        {
+            path.poses.erase(path.poses.begin(),
+                             path.poses.begin() + (path.poses.size() - path_max_poses));
+        }
+        // Keep recording so a late RViz still gets the window, but do not pay
+        // for serialising it when nobody listens.
+        if (pubPath->get_subscription_count() > 0) pubPath->publish(path);
     }
 }
 
@@ -1051,6 +1238,7 @@ public:
     LaserMappingNode(const rclcpp::NodeOptions& options = rclcpp::NodeOptions()) : Node("laser_mapping", options)
     {
         this->declare_parameter<bool>("publish.path_en", true);
+        this->declare_parameter<int>("publish.path_max_poses", 1000);
         this->declare_parameter<bool>("publish.effect_map_en", false);
         this->declare_parameter<bool>("publish.map_en", false);
         this->declare_parameter<bool>("publish.scan_publish_en", true);
@@ -1080,6 +1268,8 @@ public:
         this->declare_parameter<int>("preprocess.timestamp_unit", US);
         this->declare_parameter<int>("preprocess.scan_rate", 10);
         this->declare_parameter<int>("point_filter_num", 2);
+        this->declare_parameter<int>("max_lidar_buffer", 10);
+        this->declare_parameter<int>("max_imu_buffer", 4000);
         this->declare_parameter<bool>("feature_extract_enable", false);
         this->declare_parameter<bool>("runtime_pos_log_enable", false);
         this->declare_parameter<bool>("mapping.extrinsic_est_en", true);
@@ -1091,6 +1281,7 @@ public:
         this->declare_parameter<string>("base_frame", "body");
 
         this->get_parameter_or<bool>("publish.path_en", path_en, true);
+        this->get_parameter_or<int>("publish.path_max_poses", path_max_poses, 1000);
         this->get_parameter_or<bool>("publish.effect_map_en", effect_pub_en, false);
         this->get_parameter_or<bool>("publish.map_en", map_pub_en, false);
         this->get_parameter_or<bool>("publish.scan_publish_en", scan_pub_en, true);
@@ -1120,6 +1311,13 @@ public:
         this->get_parameter_or<int>("preprocess.timestamp_unit", p_pre->time_unit, US);
         this->get_parameter_or<int>("preprocess.scan_rate", p_pre->SCAN_RATE, 10);
         this->get_parameter_or<int>("point_filter_num", p_pre->point_filter_num, 2);
+        this->get_parameter_or<int>("max_lidar_buffer", max_lidar_buffer, 10);
+        this->get_parameter_or<int>("max_imu_buffer", max_imu_buffer, 4000);
+        if (max_lidar_buffer < 2) max_lidar_buffer = 2;
+        if (max_imu_buffer < 100) max_imu_buffer = 100;
+        // point_filter_num is used as "keep every Nth point" (i % n), so 0 would
+        // divide by zero and negatives would keep nothing.
+        if (p_pre->point_filter_num < 1) p_pre->point_filter_num = 1;
         this->get_parameter_or<bool>("feature_extract_enable", p_pre->feature_enabled, false);
         this->get_parameter_or<bool>("runtime_pos_log_enable", runtime_pos_log, 0);
         this->get_parameter_or<bool>("mapping.extrinsic_est_en", extrinsic_est_en, true);
@@ -1409,6 +1607,7 @@ private:
             if (effect_pub_en) publish_effect_world(pubLaserCloudEffect_);
             // if (map_pub_en) publish_map(pubLaserCloudMap_);
             const double t6 = omp_get_wtime();
+            report_health(t6 - t0);
 
             /*** perf probe: one row per processed scan (no-op when disabled) ***/
             if (flperf::enabled())
@@ -1549,9 +1748,93 @@ private:
         }
     }
 
+    // One INFO line every 10 s saying whether the node keeps up with the sensor
+    // and, if it does not, which of the two ways it is falling behind:
+    //
+    //  * proc ms creeping up toward/past the scan period (100 ms at 10 Hz):
+    //    throughput. Correlate with `map` -- the ikd-Tree only shrinks when the
+    //    robot nears the edge of cube_side_length, so it grows with the area
+    //    driven. The lidar cap then drops scans (`dropped`) instead of building
+    //    a backlog.
+    //  * `lidar-imu` (newest lidar stamp minus newest IMU stamp) drifting upward:
+    //    the lidar clock is running away from the IMU clock. sync_packages()
+    //    waits for IMU stamps to pass each scan's end, so every second of skew
+    //    is a second of added delay no matter how fast processing is. That is a
+    //    clock/PTP fault -- see perf/README.md section 5b, clock_audit.py.
+    //
+    // `age` is ROS now minus the scan end of the pose just published. Its
+    // absolute value includes any sensor-to-host clock offset (and is
+    // meaningless for a bag played without use_sim_time); its CHANGE since
+    // the first report is the latency growth.
+    void report_health(double proc_s)
+    {
+        hl_scans_++;
+        hl_proc_sum_ += proc_s;
+        hl_proc_max_ = std::max(hl_proc_max_, proc_s);
+
+        const double now_wall = omp_get_wtime();
+        if (hl_win_start_ < 0.0) hl_win_start_ = now_wall;
+        if (now_wall - hl_win_start_ < 10.0) return;
+
+        size_t n_lidar, n_imu;
+        double skew;
+        unsigned long dropped;
+        {
+            std::lock_guard<std::mutex> lock(mtx_buffer);
+            n_lidar = lidar_buffer.size();
+            n_imu   = imu_buffer.size();
+            skew    = last_timestamp_lidar - last_timestamp_imu;
+            dropped = lidar_scans_dropped;
+        }
+        const double age = this->get_clock()->now().seconds() - lidar_end_time;
+        if (std::isnan(hl_age0_))  hl_age0_  = age;
+        if (std::isnan(hl_skew0_)) hl_skew0_ = skew;
+
+        const double win      = now_wall - hl_win_start_;
+        const double proc_avg = hl_proc_sum_ / hl_scans_;
+        const double period   = (p_pre->SCAN_RATE > 0) ? 1.0 / p_pre->SCAN_RATE : 0.1;
+
+        RCLCPP_INFO(this->get_logger(),
+                    "health: %.1f scans/s | proc avg %.1f max %.1f ms | lidar q %zu imu q %zu | "
+                    "dropped %lu | map %d pts | path %zu | lidar-imu %+.3f s (%+.3f since start) | "
+                    "age %.3f s (%+.3f since start) | map publish max %.1f ms",
+                    hl_scans_ / win, proc_avg * 1e3, hl_proc_max_ * 1e3, n_lidar, n_imu,
+                    dropped - hl_dropped_last_, ikdtree.size(), path.poses.size(),
+                    skew, skew - hl_skew0_, age, age - hl_age0_, hl_map_pub_max_ * 1e3);
+
+        if (proc_avg > 0.9 * period)
+        {
+            RCLCPP_WARN(this->get_logger(),
+                        "health: average processing %.1f ms is at the %.0f ms scan period -- the "
+                        "node cannot keep up and is dropping scans. Check `map` growth above "
+                        "(cube_side_length) and point_filter_num / filter_size_surf.",
+                        proc_avg * 1e3, period * 1e3);
+        }
+        if (skew - hl_skew0_ > 0.2)
+        {
+            RCLCPP_WARN(this->get_logger(),
+                        "health: lidar stamps have drifted %.3f s ahead of IMU stamps since start. "
+                        "Each scan waits for IMU to catch up, so this is added delay that grows "
+                        "with uptime. This is a clock fault, not a FAST-LIO one: run "
+                        "perf/monitors/clock_audit.py.",
+                        skew - hl_skew0_);
+        }
+
+        hl_win_start_ = now_wall;
+        hl_scans_ = 0;
+        hl_proc_sum_ = hl_proc_max_ = hl_map_pub_max_ = 0.0;
+        hl_dropped_last_ = dropped;
+    }
+
     void map_publish_callback()
     {
-        if (map_pub_en) publish_map(pubLaserCloudMap_);
+        if (!map_pub_en) return;
+        // Runs in the same callback group as timer_callback, so every ms spent
+        // here delays scan processing -- and it is O(map size), i.e. it grows
+        // with uptime. Not part of proc_s, hence reported separately.
+        const double t = omp_get_wtime();
+        publish_map(pubLaserCloudMap_);
+        hl_map_pub_max_ = std::max(hl_map_pub_max_, omp_get_wtime() - t);
     }
 
     void map_save_callback(std_srvs::srv::Trigger::Request::ConstSharedPtr req, std_srvs::srv::Trigger::Response::SharedPtr res)
@@ -1591,6 +1874,11 @@ private:
     rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr map_save_srv_;
 
     bool effect_pub_en = false, map_pub_en = false;
+    // report_health() window
+    double hl_win_start_ = -1.0, hl_proc_sum_ = 0.0, hl_proc_max_ = 0.0, hl_map_pub_max_ = 0.0;
+    double hl_age0_ = NAN, hl_skew0_ = NAN;
+    int hl_scans_ = 0;
+    unsigned long hl_dropped_last_ = 0;
     int effect_feat_num = 0, frame_num = 0;
     double deltaT, deltaR, aver_time_consu = 0, aver_time_icp = 0, aver_time_match = 0, aver_time_incre = 0, aver_time_solve = 0, aver_time_const_H_time = 0;
     bool flg_EKF_converged, EKF_stop_flg = 0;
